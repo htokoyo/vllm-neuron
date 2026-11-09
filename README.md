@@ -66,7 +66,7 @@ to build and serve the model.
 
 | Model | Type | Instance | vLLM-Neuron Plugin | Neuron SDK | Branch |
 |---|---|---|---|---|---|
-| [Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Text | Trn2 | **0.29.0.1.2.0** | **2.33** | [`add-qwen38-flash-next`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen38-flash-next#readme) |
+| [Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Text | Trn2 | **0.29.0.1.2.0** | **2.33** | [`add-qwen38-flash-next`](https://github.com/htokoyo/vllm-neuron/blob/add-qwen38-flash-next/Qwen3.8-Flash-Next/README.md) |
 | [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-devstral-ministral3`](https://github.com/htokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
 | [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-llama-embed-nemotron`](https://github.com/htokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
 | [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/htokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
