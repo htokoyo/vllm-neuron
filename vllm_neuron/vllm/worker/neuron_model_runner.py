@@ -69,6 +69,11 @@ from vllm_neuron import envs
 from vllm_neuron.snapshot.runner_hook import SnapshotRunnerHook
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
+from vllm_neuron.vllm.worker.request_state import (
+    REQUEST_STATE_KEY,
+    RequestStateSlots,
+    model_uses_request_state,
+)
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
     EncoderCacheReadError,
@@ -1184,6 +1189,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # The runner resolves it on first use, because the model loads later.
         self._model_supports_async_reorder = None
         self.use_async_scheduling: bool = vllm_config.scheduler_config.async_scheduling
+        # Per-request state slots for models that own their recurrent state
+        # (see request_state.py); set up after the KV cache is bound.
+        self._request_state: RequestStateSlots | None = None
         if self.use_async_scheduling:
             # The on-device-sampling precondition is checked below, after the
             # mm_encoder_only construction role resolves. A vision-encoder-only
@@ -1230,6 +1238,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.speculative_config.method == "eagle3":
                 self.is_eagle3_spec = True
                 self.drafter = EagleProposer(
+                    self.vllm_config,
+                    self.device,
+                    self.on_device_sampling,
+                )
+            elif self.speculative_config.method == "mtp":
+                from vllm_neuron.vllm.spec_decode.mtp import MTPProposer
+
+                # Same fused-propose contract as Eagle-3 (draft = the target's MTP block).
+                self.is_eagle3_spec = True
+                self.drafter = MTPProposer(
                     self.vllm_config,
                     self.device,
                     self.on_device_sampling,
@@ -2028,7 +2046,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         from libtorch_neuronx_lite.compile.platform import get_platform_target
 
         has_fp8 = self.vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
-        if not has_fp8 and self.vllm_config.model_config.quantization in ("modelopt",):
+        if not has_fp8 and self.vllm_config.model_config.quantization in ("modelopt", "fp8"):
             has_fp8 = True
         if not has_fp8:
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
@@ -2777,6 +2795,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        if self._request_state is not None:
+            # A preempted request restarts from zero computed tokens, so its slot is
+            # re-assigned (and re-initialized) when it is scheduled again.
+            self._request_state.release(scheduler_output.finished_req_ids)
+            self._request_state.release(scheduler_output.preempted_req_ids)
 
         # Free the cached encoder outputs.
         # NOTE: upstream GPUModelRunner stores encoder cache as a dict[str, torch.Tensor]
@@ -4149,6 +4172,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Store padding map for later use in output extraction
         self._current_padding_map = padding_map
+        if self._request_state is not None:
+            # Table row (-1 for padding) and position of every token, real tokens per row.
+            tok_rows = np.concatenate([
+                np.r_[np.full(int(a), i), np.full(int(p) - int(a), -1)]
+                for i, (a, p) in enumerate(zip(actual_num_tokens, num_scheduled_tokens_padded))
+            ]).astype(np.int64)
+            self._request_state.record_layout(
+                tok_rows, cache_positions.numpy().astype(np.int64), actual_num_tokens
+            )
 
         # Compute slot mapping positions.
         # After padding, cache_positions contains bounded values for padding
@@ -5698,6 +5730,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
+        if self._request_state is not None:
+            # Appended last so next(iter(attn_metadata.values())) stays a layer entry.
+            attn_metadata[REQUEST_STATE_KEY] = self._request_state.runtime_metadata(
+                self.input_batch, padded_num_reqs, total_num_scheduled_tokens
+            )
         return attn_metadata
 
     def _build_warmup_attention_metadata(
@@ -5877,6 +5914,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
+        if self._request_state is not None:
+            # Same keys and shapes as the runtime builder.
+            first = next(iter(attn_metadata.values()))
+            attn_metadata[REQUEST_STATE_KEY] = self._request_state.warmup_metadata(
+                first["block_table_tensor"].shape[0], num_tokens
+            )
         return attn_metadata
 
     def _build_prefill_synthetic_inputs(
@@ -10801,6 +10844,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_caches[layer_name] = [K_list[i], V_list[i]]
             self._kv_cache_full_tensors[layer_name] = group_bufs[i]
         self.model.bind_kv_cache(kv_caches)
+        self._init_request_state()
         self.model.set_kv_cache_buffers(K_list, V_list)
 
         if has_kv_transfer_group():
@@ -10884,6 +10928,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if packed:
             return (num_blocks, num_kv_heads, block_size // 2, head_size, 2)
         return (num_blocks, num_kv_heads, block_size, head_size)
+
+    def _init_request_state(self) -> None:
+        """Allocate per-request state slots if the model owns its recurrent state."""
+        if self._request_state is None and model_uses_request_state(self.model):
+            self._request_state = RequestStateSlots(self.model, self.max_num_reqs, self.device)
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig
@@ -11152,13 +11201,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
+        self._init_request_state()
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, (EagleProposer, DFlashProposer))
             assert self.drafter.model is not None
             self.drafter.model.bind_kv_cache(kv_caches)
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
-            if isinstance(self.drafter, DFlashProposer):
+            if isinstance(self.drafter, DFlashProposer) or hasattr(self.drafter, "alias_target_weights"):
                 self.drafter.alias_target_weights(target_model=self.model)
 
         if has_kv_transfer_group():
@@ -11240,7 +11290,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
-                all_kv_cache_specs[layer_name] = FullAttentionSpec(
+                all_kv_cache_specs[layer_name] = (KeyOnlyAttentionSpec if layer.key_only else FullAttentionSpec)(  # key-only: a draft's indexer cache
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
                     head_size=layer.head_size,

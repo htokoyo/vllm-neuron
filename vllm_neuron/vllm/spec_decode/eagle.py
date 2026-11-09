@@ -42,7 +42,7 @@ class EagleProposer:
 
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
-        assert self.method == "eagle3"
+        assert self.method in ("eagle3", "mtp")  # "mtp": MTPProposer (spec_decode/mtp.py)
 
         self.device = device
         self.on_device_sampling = on_device_sampling

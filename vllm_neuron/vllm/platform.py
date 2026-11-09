@@ -6,6 +6,7 @@ This module provides the NeuronPlatform class that integrates vLLM Neuron with v
 platform plug-in system.
 """
 
+import copy
 import logging
 import os
 import sys
@@ -188,17 +189,50 @@ def _apply_dcp_patch(ModelConfig):
     _orig_verify = ModelConfig.verify_with_parallel_config
 
     def _patched_verify(self, parallel_config):
+        checked = _config_for_tp_checks(self, parallel_config.tensor_parallel_size)
         dcp = parallel_config.decode_context_parallel_size
         if dcp > 1 and not self.use_mla:
             saved_dcp = parallel_config.decode_context_parallel_size
             parallel_config.decode_context_parallel_size = 1
-            _orig_verify(self, parallel_config)
+            _orig_verify(checked, parallel_config)
             parallel_config.decode_context_parallel_size = saved_dcp
             return
-        _orig_verify(self, parallel_config)
+        _orig_verify(checked, parallel_config)
 
     _patched_verify._neuron_dcp_patched = True
     ModelConfig.verify_with_parallel_config = _patched_verify
+
+
+# Architectures whose model owns per-request recurrent state (see request_state.py).
+_HOST_REQUEST_STATE_ARCHS = {"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"}
+# Qwen4-Exp target and MTP draft. The port is text-only (a vision_config in the checkpoint
+# describes a tower it never builds), and it shards attention over a subgroup of the TP ranks
+# (vllm_neuron/model/qwen4_exp/parallel.py, which checks that split itself).
+_QWEN4_EXP_ARCHS = _HOST_REQUEST_STATE_ARCHS | {"Qwen4ExpMTP"}
+
+
+def _config_for_tp_checks(model_config, tp: int):
+    """The model config that vLLM's ``verify_with_parallel_config`` should check.
+
+    vLLM requires ``total_num_attention_heads % tensor_parallel_size == 0``. Qwen4-Exp (24
+    heads, served at TP 32) splits its attention over a subgroup of the TP ranks instead, so
+    for those architectures, and only when that rule would fail, a shallow copy is returned
+    whose architecture config reports the head count rounded up to a multiple of ``tp``. The
+    original config is never modified, and every other check (expert / pipeline / context
+    parallel, multimodal IPC) runs on the same values as before.
+    """
+    arch_config = getattr(model_config, "model_arch_config", None)
+    names = getattr(model_config, "architectures", None) or ()
+    if arch_config is None or not _QWEN4_EXP_ARCHS.intersection(names):
+        return model_config
+    heads = arch_config.total_num_attention_heads
+    if heads % tp == 0:
+        return model_config
+    padded_arch = copy.copy(arch_config)
+    padded_arch.total_num_attention_heads = -(-heads // tp) * tp
+    view = copy.copy(model_config)
+    view.model_arch_config = padded_arch
+    return view
 
 
 class NeuronPlatform(Platform):
@@ -215,6 +249,10 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # Fine-grained FP8 checkpoints (quant_method "fp8", e.g. Qwen3.8-Flash-Next-FP8): vLLM's
+        # Fp8Config is never instantiated as layers here -- the Neuron model reads the FP8 tensors
+        # itself (qwen4_exp); other models reject or dequantize them in their own loaders.
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -746,6 +784,14 @@ class NeuronPlatform(Platform):
         # Set custom scheduler for Neuron platform
         scheduler_config = vllm_config.scheduler_config
 
+        # Models that own their per-request recurrent state
+        # (vllm_neuron/vllm/worker/request_state.py): a cached prefix would have no state.
+        if set(getattr(model_config.hf_config, "architectures", None) or ()) & _HOST_REQUEST_STATE_ARCHS:
+            if cache_config.enable_prefix_caching:
+                logger.warning("%s: disabling prefix caching (per-request recurrent state).",
+                               model_config.architecture)
+                cache_config.enable_prefix_caching = False
+
         if scheduler_config.enable_chunked_prefill:
             logger.warning(
                 "Chunked prefill is enabled on Neuron platform. Currently Neuron only supports"
@@ -760,7 +806,12 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        # Text-only ports of vision-language checkpoints (Qwen4-Exp) build no vision
+        # encoder, so there are no encoder buckets to configure.
+        hf_config = model_config.hf_config
+        if hasattr(hf_config, "vision_config") and not _QWEN4_EXP_ARCHS.intersection(
+            getattr(hf_config, "architectures", None) or ()
+        ):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.

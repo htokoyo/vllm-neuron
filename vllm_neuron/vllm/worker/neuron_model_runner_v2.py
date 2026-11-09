@@ -678,6 +678,7 @@ class NeuronModelRunnerV2:
             )
             if not has_fp8 and self.vllm_config.model_config.quantization in (
                 "modelopt",
+                "fp8",
             ):
                 has_fp8 = True
             if not has_fp8:

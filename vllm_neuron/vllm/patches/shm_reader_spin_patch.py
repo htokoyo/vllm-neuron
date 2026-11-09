@@ -26,6 +26,7 @@ shorten the spin window and leave a dropped notification able to hang a reader f
 """
 
 import logging
+import os
 
 from vllm_neuron import envs as neuron_envs
 
@@ -127,7 +128,17 @@ def apply_shm_reader_spin_patch() -> None:
         )
         return
 
-    spin_condition_cls.__init__.__defaults__ = (READER_BUSY_LOOP_S,)
+    # VLLM_NEURON_SHM_READER_BUSY_LOOP_S (default unchanged) overrides the spin
+    # window. A window longer than the longest in-step wait (the NEFF time) keeps every reader of
+    # a running decode spinning, and still releases the core after the window when idle.
+    busy = READER_BUSY_LOOP_S
+    raw = os.environ.get("VLLM_NEURON_SHM_READER_BUSY_LOOP_S", "").strip()
+    if raw:
+        try:
+            busy = max(0.0, float(raw))
+        except ValueError:
+            logger.error("Neuron: ignoring VLLM_NEURON_SHM_READER_BUSY_LOOP_S=%r", raw)
+    spin_condition_cls.__init__.__defaults__ = (busy,)
     setattr(shm_broadcast, _UPSTREAM_RECHECK_ATTR, READER_POLL_BOUND_MS)
 
     _applied = True
@@ -135,7 +146,7 @@ def apply_shm_reader_spin_patch() -> None:
         "Neuron: shm_broadcast reader busy_loop_s %s -> %s (an idle reader now blocks "
         "instead of holding a core), and %s %s -> %s ms.",
         _EXPECTED_UPSTREAM_BUSY_LOOP_S,
-        READER_BUSY_LOOP_S,
+        busy,
         _UPSTREAM_RECHECK_ATTR,
         previous_recheck,
         READER_POLL_BOUND_MS,

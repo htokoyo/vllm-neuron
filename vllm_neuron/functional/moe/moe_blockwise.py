@@ -99,7 +99,13 @@ def build_blockwise_mapping(
     # Kernel configs
     max_chunk_size = 16384
     chunk_size = min(total_tokens, max_chunk_size)
-    f_len = min(128, total_tokens // 16)
+    # indexed_flatten needs f_len | block_size (row offsets), f_len | T and (T // f_len) % 16 == 0: the largest
+    # power of two <= min(128, T // 16) that satisfies them (T // 16 itself for power-of-two T, as before;
+    # T = 1792 gave f_len = 112, which broke the kernel's output_len % f_len assert).
+    f_len = 1
+    while f_len * 2 <= min(128, block_size, total_tokens // 16) and total_tokens % (f_len * 2) == 0 \
+            and (total_tokens // (f_len * 2)) % 16 == 0:
+        f_len *= 2
 
     # When TP-sharded, the kernel processes E_kernel = E_local // tp_degree experts
     # per rank. The kernel constraints must be checked against E_kernel, not E_local.

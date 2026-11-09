@@ -96,6 +96,13 @@ Serve embeddings via `/v1/embeddings` with a pooling model.
 Transcribe audio through online and offline interfaces.
 :::
 
+:::{grid-item-card} Deploy Qwen3.8-Flash-Next
+:link: tutorial-qwen3-8-flash-next
+:link-type: doc
+
+Deploy Qwen3.8-Flash-Next (hybrid MoE, FP8, TP=32) with vLLM on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -115,4 +122,5 @@ Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
 Disaggregated encoder (1E1PD and xEyPD) <tutorial-epd-1e-1pd-xeypd>
 Deploying Qwen3-Embedding-8B <tutorial-qwen3-embedding-8b>
 Deploying Qwen3-ASR-1.7B <tutorial-qwen3-asr-1-7b>
+Deploying Qwen3.8-Flash-Next <tutorial-qwen3-8-flash-next>
 :::

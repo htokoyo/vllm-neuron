@@ -646,16 +646,27 @@ def _topk_nki(
     leading_shape = tensor.shape[:-1]
     inp2d = tensor.reshape(-1, vocab_size)
     n_rows = inp2d.shape[0]
+    # The kernels split the rows over the LNC programs in blocks of ceil(rows / n_prgs);
+    # when rows > 1 is not a multiple of n_prgs the last program's short block comes out
+    # wrong (rotational top-k, LNC=2: rows=3 -> row 2 wrong in the NKI simulator; on
+    # device this broke greedy MTP verify at batch 1, 3 rows). Pad with zero rows to a
+    # multiple and drop them after.
+    n_prgs = _get_topk_num_programs()
+    n_pad = (-n_rows) % n_prgs if n_rows > 1 else 0
+    if n_pad:
+        inp2d = torch.cat([inp2d, inp2d.new_zeros(n_pad, vocab_size)])
 
     kernel_fn = _TOPK_KERNELS[method]
     config_builder, kernel_label = _TOPK_CONFIG_BUILDERS[method]
     _log_topk_choice(kernel_label, n_rows, vocab_size, k)
 
     nki_dtype = getattr(nl, torch_to_nki_dtype(inp2d.dtype))
-    config = config_builder(n_rows, vocab_size, k, nki_dtype)
+    config = config_builder(n_rows + n_pad, vocab_size, k, nki_dtype)
 
     topk_kernel = wrap_nki(kernel_fn)
-    values, indices = topk_kernel[_get_topk_num_programs()](inp2d, config)
+    values, indices = topk_kernel[n_prgs](inp2d, config)
+    if n_pad:
+        values, indices = values[:n_rows], indices[:n_rows]
 
     out_shape = (*leading_shape, k)
     values = values.reshape(out_shape)

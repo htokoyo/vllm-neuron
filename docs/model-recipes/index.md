@@ -47,6 +47,13 @@ Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 Model recipe for Qwen3-ASR 1.7B speech recognition on Trn2.
 :::
 
+:::{grid-item-card} Deploy Qwen3.8-Flash-Next
+:link: qwen3-8-flash-next
+:link-type: doc
+
+Model recipe for Qwen3.8-Flash-Next (hybrid MoE, FP8, TP=32) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -59,4 +66,5 @@ Qwen3-32B <qwen3-32b>
 Qwen3-VL <qwen3-vl>
 Qwen3-Embedding <qwen3-embedding-8b>
 Qwen3-ASR <qwen3-asr>
+Qwen3.8-Flash-Next <qwen3-8-flash-next>
 :::
