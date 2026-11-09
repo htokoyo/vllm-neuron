@@ -56,6 +56,33 @@ Performance improvements are delivered incrementally with each Neuron release.
 
 The [`contrib/`](contrib/) folder hosts community-contributed models. These are maintained by the community and may have limited testing compared to the officially-supported models above. To use one, or to contribute your own model, see [contrib/README.md](contrib/README.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Contributed Models
+
+Community-contributed model ports maintained on separate branches of this fork,
+not merged into this release branch. Each branch natively integrates the model
+(model package + framework touch-points) and ships a model recipe, tutorial,
+offline example, and a self-contained artifact bundle. Check out the branch
+to build and serve the model.
+
+| Model | Type | Instance | vLLM-Neuron Plugin | Neuron SDK | Branch |
+|---|---|---|---|---|---|
+| [Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) | Text | Trn2 | **0.29.0.1.2.0** | **2.33** | [`add-qwen38-flash-next`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen38-flash-next#readme) |
+| [Devstral-2-123B (Ministral3)](https://huggingface.co/mistralai/Devstral-2-123B-Instruct-2512) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-devstral-ministral3`](https://github.com/htokoyo/vllm-neuron/tree/add-devstral-ministral3/Devstral-2-123B-Instruct-2512/README.md) |
+| [llama-embed-nemotron-8b](https://huggingface.co/nvidia/llama-embed-nemotron-8b) | Embedding / pooling | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-llama-embed-nemotron`](https://github.com/htokoyo/vllm-neuron/tree/add-llama-embed-nemotron/llama-embed-nemotron-8b/README.md) |
+| [Gemma 4 31B IT](https://huggingface.co/google/gemma-4-31B-it) | Text | Trn2 | 0.21.0.1.0.0 | 2.31 | [`add-gemma4-31b`](https://github.com/htokoyo/vllm-neuron/tree/add-gemma4-31b/gemma4-31b/README.md) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) / [FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8) | Text + vision (image / video) | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-qwen36-moe`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen36-moe/Qwen3.6-35B-A3B/README.md) |
+| [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) / [FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | Text + vision (image / video) | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-qwen38-27b`](https://github.com/htokoyo/vllm-neuron/tree/add-qwen38-27b/Qwen3.8-27B/README.md) |
+| [GLM-5.3](https://huggingface.co/zai-org/GLM-5.3) (FP8) | Text | Trn2 | 0.24.0.1.1.0 | 2.32 | [`add-glm-5-3`](https://github.com/htokoyo/vllm-neuron/tree/add-glm-5-3#readme) |
+
+> **Note:** These are contributed ports on feature branches, validated for
+> correctness by their contributors. They are not part of the officially supported
+> model set listed above. Each branch targets the plugin / Neuron SDK version in
+> its row: `add-qwen38-flash-next` is hosted on **0.29.0.1.2.0 / Neuron 2.33** (this
+> base); the other branches stay on the version in their row and are re-hosted
+> individually. A branch's state before a re-host is kept as a tag suffixed with the
+> Neuron SDK version (for example `-231`), under the name the branch had at the time —
+> so GLM-5.3's predecessor is `add-glm-5-2-231`.
+
 ## Features
 
 Feature support is at the framework level. See the model cards in [`docs/model-recipes/`](docs/model-recipes/) for per-model feature availability and the [features guide](docs/guides/features-guide.md) for configuration details.
