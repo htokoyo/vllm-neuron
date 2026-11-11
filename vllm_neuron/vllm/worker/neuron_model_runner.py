@@ -70,9 +70,11 @@ from vllm_neuron.snapshot.runner_hook import SnapshotRunnerHook
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from libtorch_neuronx_lite.compile.compiler_args import scoped_compiler_args
 from vllm_neuron.vllm.worker.request_state import (
+    PLAN_ATTR as REQUEST_STATE_PLAN_ATTR,
     REQUEST_STATE_KEY,
     RequestStateSlots,
     model_uses_request_state,
+    state_snapshot_options,
 )
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
@@ -2800,6 +2802,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # re-assigned (and re-initialized) when it is scheduled again.
             self._request_state.release(scheduler_output.finished_req_ids)
             self._request_state.release(scheduler_output.preempted_req_ids)
+            # Prefix caching: the step's snapshot rows (read / write) per request.
+            self._request_state.set_plan(getattr(scheduler_output, REQUEST_STATE_PLAN_ATTR, None))
 
         # Free the cached encoder outputs.
         # NOTE: upstream GPUModelRunner stores encoder cache as a dict[str, torch.Tensor]
@@ -7511,6 +7515,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     "Disable async scheduling with: --no-async-scheduling"
                 )
 
+        # Prefix caching with per-request state: the step's snapshot rows are copied to the running
+        # slots before the forward, which reads and writes only the running slots (request_state.py).
+        if self._request_state is not None:
+            self._request_state.restore_snapshots()
+
         # Wrap with set_forward_context for DI support
         with (
             set_forward_context(
@@ -7535,6 +7544,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 rotary_position_ids=rotary_position_ids,
                 mm_kwargs=mm_kwargs,
             )
+
+        # ... and the running slots the plan stores are copied to their snapshot rows after it, in
+        # issue order behind the forward (so before any later step's restore of those rows).
+        if self._request_state is not None:
+            self._request_state.save_snapshots()
 
         # Store the last-accepted token from the rejection sampler (spec
         # decode only) so the next step's transition handler can use it
@@ -10932,7 +10946,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _init_request_state(self) -> None:
         """Allocate per-request state slots if the model owns its recurrent state."""
         if self._request_state is None and model_uses_request_state(self.model):
-            self._request_state = RequestStateSlots(self.model, self.max_num_reqs, self.device)
+            self._request_state = RequestStateSlots(
+                self.model, self.max_num_reqs, self.device,
+                **state_snapshot_options(self.vllm_config),
+                compile_copy=self._compile_state_copy,
+            )
+
+    def _compile_state_copy(self, fn):
+        """Compile the prefix-cache snapshot row copy (request_state.copy_state_rows) as its own graph.
+
+        Eager in CPU mode and with --enforce-eager. Compiled lazily by its first call, which is
+        ``warmup_request_state_copy`` at the end of warm-up.
+        """
+        if envs.VLLM_NEURON_CPU_MODE or self.vllm_config.model_config.enforce_eager:
+            return fn
+        from vllm_neuron.envs import get_compile_backend_name
+
+        return torch.compile(
+            fn,
+            backend=get_compile_backend_name(),
+            fullgraph=True,
+            dynamic=False,
+            options=dict(getattr(self, "compile_options", None) or {}),
+        )
+
+    def warmup_request_state_copy(self) -> None:
+        """Compile and run the prefix-cache snapshot row copy once (no-op without snapshot rows)."""
+        if self._request_state is not None and self._request_state.num_snapshots:
+            t0 = time.perf_counter()
+            self._request_state.warmup_copy()
+            logger.info(
+                "[request_state] snapshot row copy (%s) warmed up in %.1f s",
+                self._request_state.copy_mode,
+                time.perf_counter() - t0,
+            )
 
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig

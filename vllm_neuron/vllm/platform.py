@@ -205,6 +205,9 @@ def _apply_dcp_patch(ModelConfig):
 
 # Architectures whose model owns per-request recurrent state (see request_state.py).
 _HOST_REQUEST_STATE_ARCHS = {"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"}
+# Of those, the ones whose state pools take prefix-caching snapshot rows (request_state.py,
+# "Prefix caching"); prefix caching stays off for the others.
+_STATE_PREFIX_CACHING_ARCHS = {"Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"}
 # Qwen4-Exp target and MTP draft. The port is text-only (a vision_config in the checkpoint
 # describes a tower it never builds), and it shards attention over a subgroup of the TP ranks
 # (vllm_neuron/model/qwen4_exp/parallel.py, which checks that split itself).
@@ -313,6 +316,9 @@ class NeuronPlatform(Platform):
         # VllmConfig.__post_init__ reads and validates this property, so install
         # the Neuron policy before ModelConfig validation constructs the config.
         patch_vllm_config_for_neuron()
+        from vllm_neuron.vllm.worker.request_state import probe_prefix_caching_default
+
+        probe_prefix_caching_default()  # prefix caching: tell "no flag" from an explicit flag
 
         if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             from vllm.model_executor.models.registry import ModelRegistry
@@ -785,12 +791,45 @@ class NeuronPlatform(Platform):
         scheduler_config = vllm_config.scheduler_config
 
         # Models that own their per-request recurrent state
-        # (vllm_neuron/vllm/worker/request_state.py): a cached prefix would have no state.
-        if set(getattr(model_config.hf_config, "architectures", None) or ()) & _HOST_REQUEST_STATE_ARCHS:
-            if cache_config.enable_prefix_caching:
+        # (vllm_neuron/vllm/worker/request_state.py): a cached prefix needs the state at its
+        # end, which only models with snapshot rows keep (align mode); off for the others.
+        archs = set(getattr(model_config.hf_config, "architectures", None) or ())
+        if archs & _HOST_REQUEST_STATE_ARCHS and cache_config.enable_prefix_caching:
+            from vllm_neuron.vllm.worker.request_state import (
+                prefix_caching_auto_off_reason,
+                single_shot_segment_buckets,
+                state_snapshot_rows,
+            )
+
+            if archs & _STATE_PREFIX_CACHING_ARCHS and (seg := single_shot_segment_buckets(vllm_config)):
+                # Single-shot prefill size: the runner needs explicit segment buckets for prefix caching.
+                vllm_config.additional_config.setdefault("neuron_config", {})["kv_segment_size_buckets"] = seg
+                logger.info("%s: prefix caching with a single-shot prefill size: kv_segment_size_buckets=%s",
+                            model_config.architecture, seg)
+            if not archs & _STATE_PREFIX_CACHING_ARCHS:
                 logger.warning("%s: disabling prefix caching (per-request recurrent state).",
                                model_config.architecture)
                 cache_config.enable_prefix_caching = False
+            elif reason := prefix_caching_auto_off_reason(vllm_config):
+                # Neither --enable- nor --no-enable-prefix-caching: on only where usable.
+                logger.warning(
+                    "%s: prefix caching left off (%s). Align-mode prefix caching needs segmented "
+                    "prefill: pass --enable-prefix-caching with a chunked prefill (e.g. "
+                    "--max-num-batched-tokens 1024) or kv_segment_size_buckets to use it, or "
+                    "--no-enable-prefix-caching to silence this.", model_config.architecture, reason)
+                cache_config.enable_prefix_caching = False
+                cache_config.mamba_cache_mode = "none"  # what vLLM sets with prefix caching off
+                if not cache_config.user_specified_mamba_block_size:
+                    cache_config.mamba_block_size = model_config.max_model_len
+            else:
+                if getattr(cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
+                    raise ValueError(f"{model_config.architecture}: prefix caching supports "
+                                     f"--mamba-cache-mode align only, got {cache_config.mamba_cache_mode}")
+                if not scheduler_config.enable_chunked_prefill:
+                    raise ValueError(f"{model_config.architecture}: prefix caching needs chunked prefill "
+                                     "(chunks end on block boundaries)")
+                logger.info("%s: prefix caching in align mode with %d state snapshot rows.",
+                            model_config.architecture, state_snapshot_rows(vllm_config))
 
         if scheduler_config.enable_chunked_prefill:
             logger.warning(
@@ -868,12 +907,30 @@ class NeuronPlatform(Platform):
                 scheduler_config.scheduler_cls = (
                     "vllm_neuron.vllm.core.scheduler.NeuronScheduler"
                 )
+            from vllm_neuron.vllm.worker.request_state import state_snapshot_rows
+
+            if state_snapshot_rows(vllm_config):
+                # Prefix caching for a model with per-request state (state_prefix_cache.py).
+                scheduler_config.scheduler_cls = scheduler_config.scheduler_cls.replace(
+                    "vllm_neuron.vllm.core.scheduler.Neuron",
+                    "vllm_neuron.vllm.core.state_prefix_cache.StatePrefixCacheNeuron",
+                )
         else:
             logger.warning(
                 "scheduler_cls already set to non-default: %s, "
                 "NOT overriding with custom Neuron scheduler",
                 scheduler_config.scheduler_cls,
             )
+            from vllm_neuron.vllm.worker.request_state import state_snapshot_rows
+
+            if state_snapshot_rows(vllm_config) and "StatePrefixCache" not in str(
+                scheduler_config.scheduler_cls
+            ):
+                raise ValueError(
+                    "prefix caching for a model with per-request state needs the scheduler "
+                    "of vllm_neuron/vllm/core/state_prefix_cache.py; got scheduler_cls="
+                    f"{scheduler_config.scheduler_cls}"
+                )
 
     @classmethod
     def validate_request(

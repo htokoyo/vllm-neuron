@@ -1701,6 +1701,11 @@ class NeuronWorker(WorkerBase):
         # loads the package automatically, so no explicit load call runs.
         self._save_compile_cache_artifacts()
 
+        # Prefix caching with per-request state (request_state.py): compile the snapshot row copy, a
+        # graph of its own outside the package saved above. No-op without snapshot rows.
+        if not envs.VLLM_NEURON_CPU_COMPILE and hasattr(self.model_runner, "warmup_request_state_copy"):
+            self.model_runner.warmup_request_state_copy()
+
         num_batched_tokens_buckets = (
             self.model_runner.neuron_config.num_batched_tokens_buckets
         )

@@ -14,6 +14,7 @@ Newest first.
 
 | Date | Change |
 |---|---|
+| 2026-11-12 | Prefix caching (vLLM align mode) is supported and on by default in both configurations, the single-shot primary configuration included (`kv_segment_size_buckets` is set automatically there); it was turned off before. Each state pool gets snapshot rows (`neuron_config.prefix_cache_state_snapshots`, default 16) that keep the state on a 128-token grid, a first request shorter than four prefill chunks is chunked exactly as with prefix caching off, and decode-time states are opt-in (`neuron_config.prefix_cache_decode_snapshots`). Measured on device: a repeated prompt's TTFT drops from 0.39 s to 0.12 s (1,635 tokens) and from 11.97 s to 0.86 s (7.8K tokens, long context), with time per output token and first-request TTFT unchanged and GSM8K within 0.5 pt. See [Prefix caching](#prefix-caching-align-mode). |
 | 2026-11-09 | Initial contribution, on vllm-neuron 0.29 / Neuron 2.33. Adds the `qwen4_exp` package — a 48-layer hybrid decoder (gated DeltaNet linear attention ×3 → sparse full attention ×1, repeated 12 times), a 512-expert MoE in every layer, a 4-stream hyper-connection residual, an n-gram per-layer embedding and one MTP layer — with FP8 routed experts resident on HBM, MTP speculative decoding, async scheduling with on-device n-gram ids, and a long-context configuration at `max_model_len` 81,920 (sparse attention and prefill context buckets, selected from `max_model_len`). No environment knobs are needed. See [Verification scope](#verification-scope). |
 
 ## Introduction
@@ -129,11 +130,48 @@ The DeltaNet recurrent and convolution states and the n-gram convolution state a
 owns fixed pools of slots and the runner assigns one slot per live request
 (`vllm_neuron/vllm/worker/request_state.py`). Three consequences:
 
-- **Prefix caching is turned off** by the platform, with a warning (a cached prefix would have no state).
+- **Prefix caching** needs the state at the end of the cached prefix. With prefix caching on (the default) the
+  pools get extra snapshot rows that keep it at selected block boundaries
+  ([Prefix caching](#prefix-caching-align-mode)). The performance figures elsewhere in this document were
+  measured with it off; that section has the device measurements with it on.
 - **Padding rows** of a batched step read the pools' dummy slot, which is never written: their state writes go
   to one extra, never-read sink row of each pool (built in; nothing to set).
 - **The n-gram ids are computed inside the graph** from a per-request pool of the last tokens, so no host
   input depends on the last sampled token and async scheduling works.
+
+#### Prefix caching (align mode)
+
+The DeltaNet and convolution states cannot be rebuilt from cached KV, so a cached prefix is usable only up to a
+point whose state was kept. Prefix caching runs in vLLM's align mode (`--mamba-cache-mode align`) and is **on by
+default**. `--no-enable-prefix-caching` turns it off, when outputs must not depend on earlier requests or to save
+the snapshot rows' HBM. KV connectors are not supported with it.
+
+- **Snapshot rows.** Each state pool gets `S` extra rows for kept states (about 14 MiB of HBM per row per rank at
+  TP=32): `"neuron_config": {"prefix_cache_state_snapshots": S}`, default 16.
+- **Which request hits.** States are kept on a 128-token grid (the DeltaNet prefill kernel's chunk). With
+  single-shot prefill (the primary configuration) the second request on a prefix keeps its state and the third
+  and later ones hit; with 1,024-token chunks (long context) the second request hits. A first request shorter
+  than four prefill chunks is prefilled exactly as with prefix caching off. For single-shot prefill the platform
+  sets `kv_segment_size_buckets` to one size (2,048 in the primary configuration), which a hit needs.
+- **Decode-time states (opt-in).** `"prefix_cache_decode_snapshots": true` also keeps states reached during
+  decode, so a multi-turn follow-up that repeats the answer hits beyond the previous prompt. With MTP it adds a
+  state write per verify row on every step; checked on the CPU engine only.
+- **Outputs.** Repeating a request gives the same greedy tokens. A hit changes where the prefill is split, which
+  on device alone can change greedy tokens (bf16 rounding); the GSM8K accuracy is unchanged.
+- **Measured on device** (TP=32, FP8, MTP k=2, async scheduling, greedy, warm compile cache):
+
+  | | Prefix caching off | Prefix caching on |
+  |---|---|---|
+  | Primary, TTFT of a repeated 1,635-token prompt | 0.39 s (every request cold) | 0.12 s (hit, 1,536 cached) |
+  | Long context, TTFT of a repeated 7.8K-token prompt | 11.97 s (every request cold) | 0.86 s (hit, 7,680 cached) |
+  | Primary, time per output token, B=1 / 8 / 16 | 12.21 / 30.47 / 51.03 ms | 12.22 / 30.24 / 51.13 ms |
+  | Primary, GSM8K full test set, strict / flexible | 0.934 / 0.941 | 0.932 / 0.936 |
+
+  A first request costs the same as with prefix caching off (TTFT 0.392–0.399 s at 1,635 tokens, 0.391–0.397 s
+  off, same-day runs).
+- Turning prefix caching on or off changes the graphs, and the first serve after this update recompiles every
+  graph once. Not measured: `S` above 16, decode-time states on device, random sampling with prefix caching,
+  more than 16 concurrent requests.
 
 ## Required knobs
 
@@ -144,7 +182,6 @@ Every measured configuration sets these; the right column says what happens with
 | `--async-scheduling` | Synchronous scheduling. Async scheduling is the largest single B=1 lever: it hides the host work of a step behind the device step (about −4.7 ms per output token measured during development). |
 | `--enable-expert-parallel` + `"ep_degree": 4` | Required for TP=32 (see [Parallel layout](#parallel-layout-tp32-with-attention-groups-of-8)). |
 | `--limit-mm-per-prompt '{"image": 0, "video": 0}'` | The text path only; the vision tower is never built. |
-| `--no-enable-prefix-caching` | The platform turns it off anyway (per-request recurrent state); pass it to keep the resolved configuration explicit. |
 | `--block-size 32` | The value every measurement used. |
 | `NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS=20` (8 for long context) | Without an explicit count the compile pool is sized from the vCPU count; a fully cold TP=32 build then runs enough compiler processes at once to exceed the host RAM of a `trn2.48xlarge`. Each long-context graph needs more host memory to compile: there a pool of 12 already reached about 1.55 TB within 20 minutes, while 8 completed. |
 | `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT=14400`, `VLLM_NEURON_BARRIER_TIMEOUT=14400` | The NEFF compile lock is broken after 20 minutes by default, after which every rank compiles the same graph; the rank barrier default (1 hour) is shorter than a cold compile of this model. |
@@ -170,7 +207,7 @@ Every measured configuration sets these; the right column says what happens with
 | **Speculative decoding** | MTP k=2 | ✅ Both configurations |
 | | MTP k=3 | ✅ Runs at B=1 (earlier revision of this port); B > 1 not verified |
 | **Scheduling** | Async scheduling (n-gram ids computed on device) | ✅ |
-| | Prefix caching | ❌ Not supported by this implementation: the DeltaNet / convolution / n-gram state of each request is kept per request, and a cached prefix would have no matching state, so the platform turns it off |
+| | Prefix caching (align mode, states kept on a 128-token grid) | ✅ On by default in both configurations. On device: time per output token and first-request TTFT unchanged, GSM8K within 0.5 pt; with single-shot prefill the third request of a prefix hits, with 1,024-token chunks the second ([Prefix caching](#prefix-caching-align-mode)) |
 | **Context** | `max_model_len` 2,048 | ✅ Primary |
 | | `max_model_len` 81,920 | ✅ Long-context configuration (1,024-token prefill chunks) |
 | | Prefill context buckets (automatic above `max_model_len` 32,768) | ✅ Long-context configuration |
@@ -247,8 +284,8 @@ export NKI_COMPILE_CACHE_URL=/path/to/scratch/nki_cache
 # for the activations of a batch (see Known limits).
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.09
 
-# Host path: an idle step reader spins for at most 20 ms (about one decode step) before it blocks,
-# instead of 1 s (set in every measurement)
+# Host path: keep each step reader spinning for up to 20 ms (about one decode step) before it blocks;
+# the plugin's default window is 0.2 ms (set in every measurement)
 export VLLM_NEURON_SHM_READER_BUSY_LOOP_S=0.02
 
 # Cold compile of TP=32: a bounded compiler pool (the default, sized from the vCPU count, exceeds the host
@@ -299,7 +336,6 @@ vllm serve /path/to/models/Qwen3.8-Flash-Next-FP8 \
   --max-num-batched-tokens 2048 \
   --max-num-seqs 16 \
   --block-size 32 \
-  --no-enable-prefix-caching \
   --async-scheduling \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}' \
@@ -332,7 +368,6 @@ vllm serve /path/to/models/Qwen3.8-Flash-Next-FP8 \
   --max-num-batched-tokens 1024 \
   --max-num-seqs 4 \
   --block-size 32 \
-  --no-enable-prefix-caching \
   --async-scheduling \
   --limit-mm-per-prompt '{"image": 0, "video": 0}' \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 2}' \
@@ -528,7 +563,8 @@ vllm_neuron/_kernels/qwen4_exp/
 
 ```text
 vllm_neuron/vllm/spec_decode/mtp.py          # MTP proposer (speculative_config method "mtp"), on the Eagle fused-propose contract
-vllm_neuron/vllm/worker/request_state.py     # Per-request state slots for models that own their recurrent state
+vllm_neuron/vllm/worker/request_state.py     # Per-request state slots for models that own their recurrent state; prefix-caching snapshot rows and directory
+vllm_neuron/vllm/core/state_prefix_cache.py  # Neuron scheduler with the state snapshot directory (selected only with prefix caching on)
 ```
 
 **Modified — shared framework files**
@@ -538,10 +574,11 @@ vllm_neuron/functional/moe/moe_blockwise.py         # Choose a flatten length th
 vllm_neuron/functional/topk.py                      # Pad the NKI top-k rows to a multiple of the LNC programs (3-row MTP verify at B=1)
 vllm_neuron/model/registry.py                       # Register Qwen4ExpForCausalLM / Qwen4ExpForConditionalGeneration / Qwen4ExpMTP
 vllm_neuron/vllm/patches/shm_reader_spin_patch.py   # VLLM_NEURON_SHM_READER_BUSY_LOOP_S override (default unchanged)
-vllm_neuron/vllm/platform.py                        # Accept quantization "fp8"; attention-group TP check; prefix caching off for state-owning models; no vision buckets for the text-only port
+vllm_neuron/vllm/platform.py                        # Accept quantization "fp8"; attention-group TP check; prefix caching in align mode for state-owning models (scheduler selection; a single-size kv_segment_size_buckets when prefill is single-shot); no vision buckets for the text-only port
 vllm_neuron/vllm/spec_decode/eagle.py               # Accept method "mtp"
-vllm_neuron/vllm/worker/neuron_model_runner.py      # Request-state slot assignment, MTP wiring, key-only indexer KV spec for the draft
+vllm_neuron/vllm/worker/neuron_model_runner.py      # Request-state slot assignment (+ snapshot rows and the per-step plan), MTP wiring, key-only indexer KV spec for the draft
 vllm_neuron/vllm/worker/neuron_model_runner_v2.py   # Quantization "fp8" enables the trn2 FP8 compiler flag
+vllm_neuron/vllm/worker/neuron_worker.py            # Compile the prefix-cache snapshot row copy after warm-up
 ```
 
 **New — offline inference example**

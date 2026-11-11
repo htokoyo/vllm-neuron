@@ -8,6 +8,8 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
 
+from .layers import GDN_CTE_CHUNK
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,6 +20,11 @@ class Qwen4ExpForCausalLM(nn.Module):
     (``Qwen4ExpForConditionalGeneration``) is served text-only: the vision tower
     and the MTP layer are not loaded.
     """
+
+    # Prefix caching (vllm_neuron/vllm/worker/request_state.py): state snapshots sit on multiples of
+    # lcm(block_size, this), the gated-DeltaNet prefill kernel's chunk, so a prefill resumed from a cache hit
+    # runs on the same chunk grid as the cold run.
+    state_snapshot_alignment = GDN_CTE_CHUNK
 
     def __init__(self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None = None,
                  **kwargs) -> None:

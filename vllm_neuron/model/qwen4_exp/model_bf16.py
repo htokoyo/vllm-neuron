@@ -205,7 +205,7 @@ class Qwen4ExpForCausalLM(nn.Module):
         shape = (b, t // b)
         ids = input_ids.long().view(shape)
         pos = positions.long().view(shape)
-        slots = rs["state_indices"][:b].long()
+        slots = rs["state_indices"][:b].long(); read_slots = _state_read_slots(rs, slots, b)  # prefix caching
         has_init = rs["has_initial_state"][:b].bool()
         num_valid = rs["num_valid"][:b]
 
@@ -215,7 +215,7 @@ class Qwen4ExpForCausalLM(nn.Module):
         for i, layer in enumerate(self.model.layers):
             s = {}
             for key, pool in self._state_pool[i].items():
-                rows = _pool_rows(pool, slots, b)  # _state_rows
+                rows = _pool_rows(pool, read_slots, b)  # _state_rows
                 keep = has_init.view(-1, *([1] * (rows.dim() - 1)))
                 s[key] = torch.where(keep, rows, torch.zeros_like(rows)) if is_prefill else rows  # decode: see _DECODE_ROWS
             if layer.layer_type == FULL_ATTENTION:
@@ -440,7 +440,7 @@ def _mtp_forward(self, input_ids, positions, attn_metadata, sampling_positions, 
     shape = (b, t // b)
     ids = input_ids.long().view(shape)
     pos = positions.long().view(shape)
-    slots = rs["state_indices"][:b].long()
+    slots = rs["state_indices"][:b].long(); read_slots = _state_read_slots(rs, slots, b)  # prefix caching
     has_init = rs["has_initial_state"][:b].bool()
     num_valid = rs["num_valid"][:b]
 
@@ -448,7 +448,7 @@ def _mtp_forward(self, input_ids, positions, attn_metadata, sampling_positions, 
     for i, layer in enumerate(self.model.layers):
         st = {}
         for key, pool in self._state_pool[i].items():
-            rows = _pool_rows(pool, slots, b)
+            rows = _pool_rows(pool, read_slots, b)
             keep = has_init.view(-1, *([1] * (rows.dim() - 1)))
             st[key] = torch.where(keep, rows, torch.zeros_like(rows)) if is_prefill else rows  # decode: see _DECODE_ROWS
         if layer.layer_type == FULL_ATTENTION:
@@ -481,9 +481,9 @@ def _mtp_forward(self, input_ids, positions, attn_metadata, sampling_positions, 
     if verify:
         tokens = rejection_sampler(spec_decode_metadata, tokens)  # [rows, 1 + k]
         count = (tokens[:b] != -1).sum(dim=1)
-        commit = [select_verified_state(c, count) for c in cands]
+        commit = [select_verified_state(c, count) for c in cands]; _verify_snapshot_write(self, rs, pos, b, cands=cands, count=count)  # prefix caching
     else:
-        commit = new_state
+        commit = new_state; _verify_snapshot_write(self, rs, pos, b, states=None if is_prefill else new_state)  # prefix caching
     for i, st in enumerate(commit):
         for key, pool in self._state_pool[i].items():
             _pool_write(pool, slots, b, st[key])
@@ -591,11 +591,11 @@ def _device_ngram_prepare(self, input_ids, attn_metadata, spec_decode_metadata):
     b = 1 if is_prefill else t // q
     T = t // b
     eos = self.config.eos_token_id
-    slots = rs["state_indices"][:b].long()
+    slots = rs["state_indices"][:b].long(); read_slots = _state_read_slots(rs, slots, b)  # prefix caching
     has_init = rs["has_initial_state"][:b].bool()
     num_valid = rs["num_valid"][:b].to(torch.int32)
     pool = self._ngram_ctx_pool
-    ctx = pool.index_select(0, slots) if b > 0 else pool[:0]
+    ctx = pool.index_select(0, read_slots) if b > 0 else pool[:0]
     if is_prefill:
         ctx = torch.where(has_init.view(-1, 1), ctx, torch.full_like(ctx, eos))
     toks = input_ids.to(torch.int32).view(b, T).clamp(min=0)
@@ -605,7 +605,7 @@ def _device_ngram_prepare(self, input_ids, attn_metadata, spec_decode_metadata):
         win = torch.where(real.reshape(-1, 1), win, torch.full_like(win, eos))
         rs[f"ngram_ids.{i}"] = ngram_ids_from_windows(c, win)
     return dict(b=b, T=T, slots=slots, seq=torch.cat([ctx, toks], dim=1), num_valid=num_valid,
-                verify=verify)
+                verify=verify, prefill=is_prefill)
 
 
 def _device_ngram_commit(self, upd, tokens):
@@ -678,7 +678,7 @@ def _forward_device_ngram(self, input_ids, positions, inputs_embeds=None, is_tok
                         sampling_positions, sampling_params, spec_decode_metadata, logit_mask,
                         rank, **kwargs)
     tokens = out[0] if isinstance(out, tuple) else out
-    _device_ngram_commit(self, upd, tokens)
+    _device_ngram_commit(self, upd, tokens); _verify_snapshot_ngram_write(self, upd, tokens, attn_metadata["request_state"], positions)  # prefix caching
     return out
 
 Qwen4ExpForCausalLM.allocate_request_state = _allocate_request_state_device_ngram
@@ -918,3 +918,67 @@ def _allocate_request_state_ngram_consts(self, num_slots: int, device) -> None:
     _device_ngram_consts_build(self, self._ngram_ctx_pool.device)
 
 Qwen4ExpForCausalLM.allocate_request_state = _allocate_request_state_ngram_consts
+
+
+# ── Prefix caching (align mode; vllm_neuron/vllm/worker/request_state.py, "Prefix caching") ─────────────
+# With prefix caching on, the runner adds S snapshot rows to the pools (allocate_request_state's num_slots
+# includes them; the dummy slot stays the second-to-last row, so _pool_write is unchanged). The graphs now
+# read and write every pool at ``state_indices`` only: the runner restores / saves a snapshot row with a
+# row copy between graphs (request_state_pools at the end of the module; request_state.py), so it never passes
+# ``state_read_indices`` (a separate read index made device steps nondeterministic) and the reads below use
+# ``state_indices`` (the graphs of prefix caching off, with S more pool rows).
+# The edits above keep every line number of the module (NEFF keys include source lines).
+def _state_read_slots(rs, slots, b):
+    read = rs.get("state_read_indices")
+    return slots if read is None else read[:b].long()
+
+
+Qwen4ExpForCausalLM.supports_state_prefix_caching = True
+
+
+
+# Prefix caching, boundaries reached in decode / MTP verify (request_state.py, "Prefix caching"): with MTP the runner
+# passes ``state_snapshot_rows`` [rows] (a row the scheduler reserved, or the dummy slot). A decode / verify row whose
+# window of tokens at p0 .. p0 + n - 1 reaches the block boundary b = p0 + offset + 1, offset = (-p0 - 1) mod block,
+# with offset < count (the tokens whose state is kept: 1 + accepted drafts, 1 in a plain decode step) writes the
+# state after token ``offset`` to that row; every other row writes to the sink (the dummy slot maps there). Positions
+# are the corrected ones (async: the previous step's rejections), so the offset is right where the host could only
+# bound it; the host publishes the row once the step's output tells it which tokens were kept.
+def _verify_snapshot_write(self, rs, pos, b, cands=None, count=None, states=None):
+    snap = rs.get("state_snapshot_rows")
+    if snap is None or (cands is None and states is None):
+        return
+    from .layers import select_verified_state
+
+    off = torch.remainder(-pos[:b, 0] - 1, self.state_snapshot_block_size)
+    crossed = off < (count[:b].to(off.dtype) if count is not None else 1)
+    for i in range(len(self._state_pool)):
+        st = states[i] if cands is None else select_verified_state(cands[i], off + 1)
+        for key, pool in self._state_pool[i].items():
+            rows = torch.where(crossed, snap[:b].long(), torch.full_like(snap[:b].long(), pool.shape[0] - 2))
+            _pool_write(pool, rows, b, st[key])
+
+
+def _verify_snapshot_ngram_write(self, upd, tokens, rs, positions):
+    snap = rs.get("state_snapshot_rows")
+    if snap is None or upd["prefill"]:
+        return
+    b, T, seq = upd["b"], upd["T"], upd["seq"]
+    count = (tokens[:b] != -1).sum(dim=1).to(torch.int32) if upd["verify"] else upd["num_valid"]
+    off = torch.remainder(-positions.view(b, T)[:, 0].to(torch.int32) - 1, self.state_snapshot_block_size)
+    w = self._ngram_ctx_pool.shape[1]
+    idx = (off + 1).clamp(max=T).view(-1, 1) + torch.arange(w, device=seq.device, dtype=torch.int32).view(1, w)
+    new = torch.gather(seq, 1, idx.long())  # the w tokens before index ctx + offset + 1
+    dummy = torch.full_like(snap[:b].long(), self._ngram_ctx_pool.shape[0] - 1)
+    rows = torch.where(off < count, snap[:b].long(), dummy)
+    for j in range(b):
+        self._ngram_ctx_pool[rows[j : j + 1]] = new[j : j + 1]
+
+
+# Prefix caching, snapshot rows (request_state.py, "Prefix caching"): every per-slot pool the runner's row copies move
+# (dim 0 = pool row): the GDN / PLE state pools of every layer and the n-gram window pool.
+def _request_state_pools(self):
+    return [pool for layer in self._state_pool for pool in layer.values()] + [self._ngram_ctx_pool]
+
+
+Qwen4ExpForCausalLM.request_state_pools = _request_state_pools

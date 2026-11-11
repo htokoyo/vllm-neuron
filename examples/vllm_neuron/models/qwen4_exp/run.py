@@ -64,7 +64,7 @@ def main():
         max_num_batched_tokens=PREFILL_BUCKETS[-1],
         max_num_seqs=args.max_num_seqs,
         block_size=32,
-        # Per-request recurrent state: the platform turns prefix caching off anyway.
+        # Prefix caching stays off in this example (it is on by default for vllm serve; README: Prefix caching).
         enable_prefix_caching=False,
         async_scheduling=True,
         # Text path only: the checkpoint's vision tower is not built.
