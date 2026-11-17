@@ -11771,3 +11771,62 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def ensure_kv_transfer_shutdown(self) -> None:
         pass
+
+
+# ── Per-step host inputs joined right before the model call (request_state.join_host_inputs) ──────────────────
+# Installed only by a model that needs it (Qwen4-Exp with the host-placed PLE table, below TP 32,
+# vllm_neuron/model/qwen4_exp/ple_host.py): _execute_model_forward keeps its input ids (before the upload; a device
+# future under async scheduling) and the step's attention metadata, and the context it enters right before the model
+# call (_snapshot_capture_context) has the request state join them, after every other input is uploaded. Every other
+# configuration runs the runner as above.
+def _execute_model_forward_join(self, input_ids, positions, logits_indices, attn_metadata, *args, **kwargs):
+    self._request_state_join_src = (input_ids, attn_metadata)
+    try:
+        return _execute_model_forward_before_join(self, input_ids, positions, logits_indices, attn_metadata,
+                                                  *args, **kwargs)
+    finally:
+        self._request_state_join_src = None
+
+
+def _join_materialize_previous_output(self, attn_metadata) -> bool:
+    """Async scheduling, decode-shaped step: write the previous step's sampled tokens into THIS rank's token table.
+
+    Upstream materializes an async output only on the output rank, on its WorkerAsyncOutputCopy thread
+    (multiproc_executor: ``if output_rank is None or self.rank == output_rank``), so the other ranks' token tables
+    lag. ``get_output`` is idempotent under a per-object lock: the future is read back once per rank, whichever
+    thread gets there first, and the join then needs no host read of a device tensor (ple_host._join_decode).
+    """
+    if not getattr(self, "use_async_scheduling", False) or not self.async_execution_buffer:
+        return False
+    first = next(iter(attn_metadata.values()))
+    if not (isinstance(first, dict) and first["max_query_len"] <= first["decode_token_threshold"]):
+        return False  # a prefill-shaped step joins prompt tokens from the token table (built at preparation)
+    previous = self.async_execution_buffer.get("async_output")
+    if previous is None:
+        return False
+    previous.get_output()
+    return True
+
+
+@contextmanager
+def _snapshot_capture_context_join(self, positions, spec_decode_metadata):
+    src, self._request_state_join_src = getattr(self, "_request_state_join_src", None), None
+    if src is not None and self._request_state is not None and src[1]:
+        _join_materialize_previous_output(self, src[1])
+        self._request_state.join_host_inputs(src[0], src[1], self.input_batch)
+    with _snapshot_capture_context_before_join(self, positions, spec_decode_metadata):
+        yield
+
+
+def install_request_state_join() -> None:
+    """Install the join (idempotent; once per process, for every runner of the process)."""
+    global _execute_model_forward_before_join, _snapshot_capture_context_before_join
+    from vllm_neuron.vllm.worker.request_state import install_join
+
+    install_join()
+    if NeuronModelRunner._execute_model_forward is _execute_model_forward_join:
+        return
+    _execute_model_forward_before_join = NeuronModelRunner._execute_model_forward
+    _snapshot_capture_context_before_join = NeuronModelRunner._snapshot_capture_context
+    NeuronModelRunner._execute_model_forward = _execute_model_forward_join
+    NeuronModelRunner._snapshot_capture_context = _snapshot_capture_context_join

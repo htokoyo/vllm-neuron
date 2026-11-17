@@ -25,7 +25,7 @@ import torch
 from torch import nn
 
 from .config import FULL_ATTENTION, Qwen4ExpConfig
-from .layers import Qwen4ExpDecoderLayer, Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
+from .layers import Qwen4ExpDecoderLayer, Qwen4ExpGatedResidual, Qwen4ExpRMSNorm, _hcs_tag
 from .parallel import shard_pieces, sharded_lookup
 
 MTP_PREFIX = "mtp."
@@ -50,6 +50,9 @@ class Qwen4ExpMTP(nn.Module):
         assert self.layers[0].ple is None
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(config, use_combine=False)
         self._target: tuple = ()  # (target,) — a tuple, so its modules are not registered here
+        # The drafter's three hyper-connection reads (its decoder layer's two and its mixer) are split by tokens over
+        # the attention group in its prefill pass (layers._hcs_forward); its decode steps have fewer rows.
+        _hcs_tag(self, self.config.attn_tp)
 
     def alias_target_weights(self, target) -> None:
         """Share the target's (vocab-sharded) embedding table and LM head."""
@@ -111,10 +114,8 @@ class Qwen4ExpMTP(nn.Module):
         attn.k_cache, attn.v_cache = kv_caches[self.attn_layer_name][0], kv_caches[self.attn_layer_name][1]
 
     def _greedy(self, streams):
-        from .parallel import all_gather_last
-
         logits = self._target[0].lm_head(self.hyper_connection_mixer(streams))
-        return all_gather_last(logits, self.config.tp).argmax(-1).to(torch.int32)
+        return sharded_argmax(logits, self.config.tp).to(torch.int32)  # argmax over the vocab shards (below)
 
     def forward(self, input_ids, positions, initial_target_hidden_states, attn_metadata=None,
                 sampling_positions=None, rank=None, raw_sampled_token_ids=None,
@@ -271,3 +272,28 @@ def _mtp_kv_layer_names(self) -> list[str]:
 Qwen4ExpMTP.get_kv_spec = _mtp_get_kv_spec
 Qwen4ExpMTP.bind_kv_cache = _mtp_bind_kv_cache
 Qwen4ExpMTP.kv_layer_names = property(_mtp_kv_layer_names)
+
+
+# ── MTP draft argmax over the vocab shards ─────────────────────────────────────────────────────────────────────
+# Gathering the [rows, vocab / W] logits of every rank and taking argmax over [rows, vocab] took 1.87 ms on GpSimd per
+# TP32 B=8 draft step (24 rows x 248,320) in a device profile. _greedy instead has each rank take argmax over its own
+# shard and the ranks all-gather one (max value, local index) pair per row, packed as fp32 (bf16 / fp16 / fp32 values and
+# indices < 2**24 are exact in fp32) in one all-gather of [rows, 2]; the first rank (in the gather's order = vocab order)
+# holding the largest value wins, with its local index. That is the same token as argmax over the whole vector under
+# argmax's own order (largest value, ties to the lowest index; NaN counts as the largest): the shards are contiguous in
+# rank order, so the first winning shard holds the lowest winning index, and argmax picks it within the shard.
+def sharded_argmax(logits: torch.Tensor, tp) -> torch.Tensor:
+    """argmax(-1) of ``logits`` [..., n] all-gathered over ``tp`` (vocab shard of n per rank), as int64 ``[...]``."""
+    from .parallel import all_gather_last
+
+    n = logits.shape[-1]
+    if n * max(tp.size, 1) > 2**24:
+        raise ValueError(f"sharded_argmax: vocab {n} x {tp.size} indices are not exact in fp32")
+    loc = logits.argmax(-1, keepdim=True)  # [..., 1]
+    val = logits.gather(-1, loc)  # the value at loc itself (so ties / NaN compare across ranks as argmax saw them)
+    pair = torch.cat([val.to(torch.float32), loc.to(torch.float32)], dim=-1)  # [..., 2]
+    g = all_gather_last(pair, tp)  # [..., 2 * W], rank r at columns 2r, 2r + 1
+    g = g.reshape(*g.shape[:-1], g.shape[-1] // 2, 2)  # (reshape: the gathered tensor need not be contiguous)
+    r = g[..., 0].argmax(-1, keepdim=True)  # [..., 1]: the first rank with the largest value
+    idx = g[..., 1].gather(-1, r)
+    return (r * n + idx.to(torch.int64)).squeeze(-1)

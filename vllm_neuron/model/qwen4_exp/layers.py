@@ -568,9 +568,14 @@ class Qwen4ExpGatedDeltaNet(nn.Module):
         return out[..., self.kernel - 1 :], window_after(x, num_valid, self.kernel)
 
     def _decode_kernel(self, x, mixed, recurrent_state):
-        """One-token step with the fused nkilib-derived ``gdn_tkg`` (l2norm, beta, g,
-        recurrence and the gated RMSNorm in one kernel)."""
-        from vllm_neuron._kernels.qwen4_exp import gdn_tkg
+        """One-token step with the fused nkilib-derived ``gdn_tkg_act`` (l2norm, beta, g,
+        recurrence and the gated RMSNorm in one kernel).
+
+        ``gdn_tkg_act`` is ``gdn_tkg`` with the activation tables grouped: the gate activation on z runs once for
+        all heads and the RMSNorm rsqrt once per ``rsqrt_group`` = 8 heads, so the activation engine no longer
+        reloads its table twice per head (a TP16 B=16 decode profile showed 3,522 table loads per step, 4.52 ms).
+        Same per-element instructions: out and state are bit-identical to ``gdn_tkg`` in the NKI simulator."""
+        from vllm_neuron._kernels.qwen4_exp.gdn_tkg_act import gdn_tkg_act; from vllm_neuron._kernels.qwen4_exp import gdn_tkg
 
         b = x.shape[0]
         rep = self.num_v_heads // self.num_k_heads
@@ -579,7 +584,7 @@ class Qwen4ExpGatedDeltaNet(nn.Module):
         q = q.view(b, self.num_k_heads, self.head_k_dim).repeat_interleave(rep, dim=1)
         k = k.view(b, self.num_k_heads, self.head_k_dim).repeat_interleave(rep, dim=1)
         bh = b * self.num_v_heads
-        out, state = _nki(gdn_tkg)(
+        out, state = _nki(gdn_tkg_act if b <= _GDN_ACT_MAX_B else gdn_tkg)(
             q=q.reshape(bh, -1).to(x.dtype),
             k=k.reshape(bh, -1).to(x.dtype),
             v=v.reshape(bh, -1).to(x.dtype),
@@ -591,6 +596,7 @@ class Qwen4ExpGatedDeltaNet(nn.Module):
             norm_weight=self.norm.weight.float(),
             state_in=recurrent_state.reshape(bh, self.head_k_dim, self.head_v_dim).float(),
             gate_activation=self.norm.activation,
+            **({"rsqrt_group": 8} if b <= _GDN_ACT_MAX_B else {}),
         )
         out = out.to(x.dtype).reshape(b, 1, self.value_dim)
         return all_reduce(self.out_proj(out), self.tp), state.reshape(recurrent_state.shape)
@@ -1263,7 +1269,7 @@ def _gdn_verify_multi_unchunked(la: Qwen4ExpGatedDeltaNet, x: torch.Tensor, stat
 # (2026-11-06). Needs the router / shared-expert weights in the kernel layout:
 # three extra buffers per MoE layer filled after load_state_dict (+2.9 MB per layer per rank). Installed by
 # patching Qwen4ExpSparseMoe below; larger decode batches, prefill and CPU (no kernel) take the original forward.
-_MOE_BLOCK_FUSED_MAX_T = 4
+_MOE_BLOCK_FUSED_MAX_T = 4  # set by TP degree at model construction (model_bf16._qwen4_exp_tp_init)
 
 
 def _moe_block_fill(moe: "Qwen4ExpSparseMoe", *_args) -> None:
@@ -1526,13 +1532,17 @@ Qwen4ExpGatedResidual.__init__ = _hc_init
 Qwen4ExpGatedResidual.forward = _hc_forward
 
 
-# Fused decode MoE block with FP8 routed experts (FP8 checkpoint): FP8 MoE layers run moe_block_tkg_fp8
-# (_kernels/qwen4_exp/moe_block_tkg.py, end of module) -- the fused router + top-k + routed experts + shared expert with
-# the FP8 e4m3 codes and their per-output-channel fp32 scales, applied where nkilib moe_tkg ROW applies them (gate/up: at
-# the PSUM drain before the LNC sum; down: at the PSUM drain, into bf16). For the same affinities the routed sum is
-# bit-identical to nkilib's all-expert moe_tkg FP8 ROW (_routed_fp8) in the NKI simulator. Buffers: the BF16 path's
-# router / shared-expert copies (_moe_block_init) + the gate/up scales transposed to [E_L, 128, 2, I / 128] (+80 KB per
-# layer per rank at I = 640); the down scales are read in place. Selected per layer from the checkpoint
+# Fused decode MoE block with FP8 routed experts (FP8 checkpoint): FP8 MoE layers run moe_block_tkg_fp8_pf
+# (_kernels/qwen4_exp/moe_block_tkg_pf.py) -- the fused router + top-k + routed experts + shared expert with the FP8 e4m3
+# codes and their per-output-channel fp32 scales, applied where nkilib moe_tkg ROW applies them (gate/up: at the PSUM
+# drain before the LNC sum; down: at the PSUM drain, into bf16). For the same affinities the routed sum is bit-identical
+# to nkilib's all-expert moe_tkg FP8 ROW (_routed_fp8) in the NKI simulator. It is moe_block_tkg_fp8
+# (_kernels/qwen4_exp/moe_block_tkg.py) with the routed experts pipelined in one loop body (the expert weights / scales
+# allocated inside the loop body, 2 experts per body with both experts' weight DMAs issued first, all experts' scales
+# loaded once per layer; bit-identical output in the NKI simulator): a TP16 decode profile of moe_block_tkg_fp8 showed
+# its loop-carried weight buffers saved to and reloaded from HBM at every loop region (3x the weight bytes per routed
+# expert). Buffers: the BF16 path's router / shared-expert copies (_moe_block_init) + the gate/up scales transposed to
+# [E_L, 128, 2, I / 128] (+80 KB per layer per rank at I = 640); the down scales are read in place. Selected per layer from the checkpoint
 # (Qwen4ExpConfig.expert_fp8): BF16 layers take _moe_block_init. An FP8 intermediate that is not a multiple of 128 keeps
 # the original FP8 module (moe_block_tkg_fp8 needs 128-row tiles; the BF16 kernel would multiply the e4m3fn codes
 # unscaled).
@@ -1572,13 +1582,13 @@ def _moe_block_forward_fp8(self, x: torch.Tensor, is_decode: bool = False) -> to
     if not (self.use_kernels and is_decode and 0 < t <= _MOE_BLOCK_FUSED_MAX_T and self.tp.size > 1
             and _kernels_available(x)):
         return _moe_block_orig_forward(self, x, is_decode)
-    from vllm_neuron._kernels.qwen4_exp.moe_block_tkg import moe_block_tkg_fp8
+    from vllm_neuron._kernels.qwen4_exp.moe_block_tkg_pf import moe_block_tkg_fp8_pf
 
     ex = self.experts
     x2 = x.reshape(t, shape[-1])
     e, h, two_i = ex.gate_up_proj.shape
     rank = rank_tensor(self.tp, x.device).reshape(1, 1)
-    out = _nki(moe_block_tkg_fp8)(
+    out = _nki(moe_block_tkg_fp8_pf)(
         x=x2, router_wt=self._mbf_router_wt, gate_up=ex.gate_up_proj.view(e, h, 2, two_i // 2), down=ex.down_proj,
         gate_up_scale_t=self._mbf_gu_scale_t, down_scale=ex.down_scale.view(e, h), shared_gu=self._mbf_shared_gu,
         shared_down=self._mbf_shared_down, rank_id=rank, top_k=self.top_k, with_shared=bool(self.shard_shared))
@@ -2500,3 +2510,289 @@ def _paged_prefill_spf(attn: Qwen4ExpAttention, x, positions, meta, num_valid=No
 
 
 _paged_prefill = _paged_prefill_spf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KV window read by whole blocks
+# ─────────────────────────────────────────────────────────────────────────────
+# The dense attention's window gather (`cache.index_select(0, table.flatten())`, _paged_decode / _paged_prefill) lowered
+# to one GpSimd software-DGE DMA per (row, token) with a 512 B descriptor per block: B * 32 DMAs per gather, 24 gathers
+# per step (7.84 ms of a TP16 B=8 decode step in a device profile). Torch re-formulations (token-row index, block-layout
+# where, no cat) changed the compiler's choice only in single-attention micro graphs, not in the real decode module.
+# kv_window_tkg gathers <= 128 whole 16 KB blocks per indirect DMA into SBUF and stores the window to HBM (3 DMAs per
+# <= 128 blocks per core), bit for bit; where the kernel cannot run (CPU, a row count the LNC grid does not divide) the
+# index_select is kept.
+def _kv_window(cache: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """``cache[table]`` as the [B, KVH, nblk * bs, D] window (``table`` [B, nblk] long, entries >= 0)."""
+    nb, kvh, bs, d = cache.shape
+    b, nblk = table.shape
+    from vllm_neuron.utils.hardware_config import get_logical_nc_config
+
+    if _kernels_available(cache) and (b * nblk) % get_logical_nc_config() == 0:
+        from vllm_neuron._kernels.qwen4_exp.kv_window import kv_window_tkg
+
+        w = _nki(kv_window_tkg)(cache=cache.view(nb, kvh * bs * d), table=table.reshape(-1, 1).to(torch.int32))
+    else:
+        w = cache.index_select(0, table.flatten())
+    return w.view(b, nblk, kvh, bs, d).permute(0, 2, 1, 3, 4).reshape(b, kvh, nblk * bs, d)
+
+
+# One-token decode. With the reference's cat after the kernel (past columns + the current token as column S), the
+# consumers read the HBM window in small pieces (B=8 ctx 512: +274 Sync DMAs). Here the current token is placed at its
+# own column p instead (S stays a multiple of 128): NEFF instructions per attention layer pair 2,744 -> 585 (B=8,
+# ctx 512), 3,932 -> 1,456 (ctx 2,048). The softmax then sums the same columns in another order (not bit-identical to
+# the reference). _paged_decode_cheap calls _paged_decode_qsa_ref for the dense / no-indexer case.
+def _paged_decode_kvw(attn: Qwen4ExpAttention, x, positions, meta, num_valid=None, idx_meta=None):
+    """:func:`_paged_decode` (reference form) with the window read by :func:`_kv_window`."""
+    b = x.shape[0]
+    q, k, v, gate = attn._qkv(x, positions)
+    kvh, d = attn.num_kv_heads, attn.head_dim
+    slots = meta["slot_mapping"].long()
+    k_tok = k.reshape(b, kvh, d).to(attn.k_cache.dtype)
+    v_tok = v.reshape(b, kvh, d).to(attn.v_cache.dtype)
+    rows_kv = kv_rows(slots, attn.k_cache)
+    kv_write(attn.k_cache, rows_kv, k_tok)
+    kv_write(attn.v_cache, rows_kv, v_tok)
+    table = meta["block_table_tensor"][:b].long().clamp(min=0)
+    kc, vc = _kv_window(attn.k_cache, table), _kv_window(attn.v_cache, table)
+    s_ctx = kc.shape[2]
+    col = torch.arange(s_ctx, device=x.device).view(1, 1, s_ctx, 1)
+    p = positions.view(b, 1, 1, 1)
+    # the current token at its own column p (< s_ctx: its block is in the table), S stays nblk * bs
+    past, here = col < p, col == p
+    kc = torch.where(past, kc, torch.where(here, k_tok.view(b, kvh, 1, d), torch.zeros_like(kc)))
+    vc = torch.where(past, vc, torch.where(here, v_tok.view(b, kvh, 1, d), torch.zeros_like(vc)))
+    mask = (col <= p).view(b, 1, 1, s_ctx)
+    if not attn.dense:
+        cur = positions.view(b, 1).long()
+        sel = _qsa_token_mask(attn, x, positions, idx_meta, cur, None)
+        mask = mask & sel[:, :, :s_ctx][:, None]  # column p is sel[..., p] (the reference's extra column)
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2), kc.to(q.dtype), vc.to(q.dtype), attn_mask=mask,
+        scale=attn.head_dim**-0.5, enable_gqa=True,
+    )
+    out = out.transpose(1, 2).reshape(b, 1, -1) * torch.sigmoid(gate)
+    return all_reduce(attn.o_proj(out), attn.tp)
+
+
+_paged_decode_qsa_ref = _paged_decode_kvw
+
+
+# Steps of 2 .. 4 tokens per row (MTP verify, T = 1 + k, and the drafter's first pass) reach forward_paged with
+# x.shape[1] > 1, i.e. _paged_prefill -> _paged_prefill_spf -> _paged_prefill_cheap -> the dense reference
+# _paged_prefill (above), whose window gather took 512 serial GpSimd indirect DMAs per full-attention layer at B=8
+# (2 x 8 rows x 32 blocks, 591 us) plus 185 us of where / cat (9.9 ms of a 51 ms TP32 MTP-2 B=8 verify step in a device
+# profile; 1.57 ms at B=1). _paged_prefill_vkw takes the dense steps of T <= _VKW_MAX_T tokens with the reference's
+# lines and the window read by _kv_window (whole blocks, bit for bit: every SDPA input is bit-identical) and passes
+# every other call (prefill chunks, QSA) to the previous _paged_prefill unchanged. Same attention as the reference:
+# each row's past positions (< its first position this step) from the cache, zeroed elsewhere (never-written HBM may
+# hold NaN), this step's T keys / values from the projection, causal within the step and < num_valid.
+_VKW_MAX_T = 4  # MTP k <= 3 (verify 1 + k rows per request); 1-token steps never come here (forward_paged: _paged_decode)
+_paged_prefill_other = _paged_prefill  # = _paged_prefill_spf
+
+
+def _paged_prefill_vkw(attn: Qwen4ExpAttention, x, positions, meta, num_valid=None, idx_meta=None):
+    """:func:`_paged_prefill` (the dense reference) for steps of <= _VKW_MAX_T tokens, the window read by :func:`_kv_window`."""
+    b, t, _ = x.shape
+    if not attn.dense or t > _VKW_MAX_T:
+        return _paged_prefill_other(attn, x, positions, meta, num_valid, idx_meta)
+    q, k, v, gate = attn._qkv(x, positions)
+    kvh, d = attn.num_kv_heads, attn.head_dim
+    slots = meta["slot_mapping"].long()
+    k_new = k.transpose(1, 2).to(attn.k_cache.dtype)  # [B, KVH, T, D]
+    v_new = v.transpose(1, 2).to(attn.v_cache.dtype)
+    # Written before the window read (see kv_write): the window keeps only positions < start.
+    rows_kv = kv_rows(slots, attn.k_cache)
+    kv_write(attn.k_cache, rows_kv, k.reshape(b * t, kvh, d))
+    kv_write(attn.v_cache, rows_kv, v.reshape(b * t, kvh, d))
+    # Unused block-table entries may be negative (-1); they are masked, so read block 0.
+    table = meta["block_table_tensor"][:b].long().clamp(min=0)
+    kc, vc = _kv_window(attn.k_cache, table), _kv_window(attn.v_cache, table)
+    s_ctx = kc.shape[2]
+    start = positions[:, :1].long()  # [B, 1]
+    i = torch.arange(t, device=x.device)
+    # the reference's lines (past columns zeroed, this step's keys concatenated)
+    past = torch.arange(s_ctx, device=x.device).view(1, s_ctx) < start  # [B, S]
+    kc = torch.cat([torch.where(past.view(b, 1, s_ctx, 1), kc, torch.zeros_like(kc)), k_new], dim=2)
+    vc = torch.cat([torch.where(past.view(b, 1, s_ctx, 1), vc, torch.zeros_like(vc)), v_new], dim=2)
+    own = i.view(1, 1, t) <= i.view(1, t, 1)  # causal within the chunk
+    if num_valid is not None:
+        own = own & (i.view(1, 1, t) < num_valid.view(b, 1, 1))  # padding keys never attended
+    mask = torch.cat([past.view(b, -1, s_ctx).expand(b, t, s_ctx), own.expand(b, t, t)], dim=-1)
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2), kc.to(q.dtype), vc.to(q.dtype), attn_mask=mask[:, None],
+        scale=attn.head_dim**-0.5, enable_gqa=True,
+    )
+    out = out.transpose(1, 2).reshape(b, t, -1) * torch.sigmoid(gate)
+    return all_reduce(attn.o_proj(out), attn.tp)
+
+
+_paged_prefill = _paged_prefill_vkw  # forward_paged looks the name up at call time
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One copy of the hyper-connection transposes (on at TP <= 16, set at model construction)
+# ─────────────────────────────────────────────────────────────────────────────
+# The fused read kernel's _hcf_wd_t / _hcf_wup_t (_hc_fill: kernel_layout's w_down.t() / w_up.t(), .contiguous(), in the
+# weights' dtype) and the [in, out] copies _wio_t of input_mix_weight_down / input_mix_weight_up (wio_wrap: _wio_fill,
+# w.t().contiguous()) are the same tensors: [D, R] / [R, D], same dtype, device and strides, never written in place
+# (both hooks rebind). Two of them per weight cost 13.1 MB per hyper-connection per rank at any TP (97 in the target,
+# 3 in the MTP block: 1.18 / 1.22 GiB). After load, a post-hook (registered after _hc_fill, and the Linears' own hooks
+# run before their parent's) checks the pair bit-equal and rebinds _hcf_* to the Linear's _wio_t; _apply (.to(device),
+# .to(dtype)) leaves the alias out while the child moves its copy and rebinds it after, because Module._apply would
+# otherwise make a separate copy of each buffer and the saving would be lost on device. No traced code changes: a graph
+# reads _hcf_* (hc_cte, > 32 rows, multiples of 128) or _wio_t (<= 32 rows, row chunks), so only a graph that runs one
+# module both ways (the MTP drafter's mixer, if a draft step has 128 rows and a later one fewer) sees one input fewer
+# (libtorch_neuronx_lite's input dedup keys on storage identity) and compiles anew. Model construction
+# (model_bf16._qwen4_exp_tp_init) turns it on where the weights need the room (TP <= 16); TP 32 keeps two copies.
+_HCA_PAIRS = (("_hcf_wd_t", "input_mix_weight_down"), ("_hcf_wup_t", "input_mix_weight_up"))
+_HCA_ON = False  # set by model_bf16._qwen4_exp_tp_init at model construction
+
+
+def _hca_fill(mod: "Qwen4ExpGatedResidual", *_args) -> None:
+    """load_state_dict post-hook (after _hc_fill): _hcf_wd_t / _hcf_wup_t become the Linears' _wio_t."""
+    if not _HCA_ON or not mod._hcf_ready:
+        return
+    for name, lin_name in _HCA_PAIRS:
+        lin = getattr(mod, lin_name)
+        src, dup = lin._buffers.get("_wio_t"), mod._buffers.get(name)
+        if src is None or dup is None or src is dup or not lin._wio_ready:
+            continue
+        same = (src.shape == dup.shape and src.dtype == dup.dtype and src.device == dup.device
+                and src.stride() == dup.stride() and torch.equal(src, dup))
+        if not same:
+            raise RuntimeError(f"{lin_name}._wio_t != {name} ({tuple(src.shape)} {src.dtype} vs "
+                               f"{tuple(dup.shape)} {dup.dtype}): the two layouts diverged, no alias")
+        mod._buffers[name] = src
+
+
+def _hca_init(self, config, use_combine=True):
+    _hca_orig_init(self, config, use_combine)
+    self.register_load_state_dict_post_hook(_hca_fill)
+
+
+def _hca_apply(self, fn, recurse=True):
+    held = []
+    if recurse:
+        for name, lin_name in _HCA_PAIRS:
+            lin, buf = self._modules.get(lin_name), self._buffers.get(name)
+            if buf is not None and lin is not None and buf is lin._buffers.get("_wio_t"):
+                self._buffers[name] = None  # Module._apply skips None buffers
+                held.append((name, lin))
+    try:
+        return _hca_orig_apply(self, fn, recurse)
+    finally:
+        for name, lin in held:
+            self._buffers[name] = lin._buffers["_wio_t"]
+
+
+_hca_orig_init = Qwen4ExpGatedResidual.__init__
+_hca_orig_apply = Qwen4ExpGatedResidual._apply
+Qwen4ExpGatedResidual.__init__ = _hca_init
+Qwen4ExpGatedResidual._apply = _hca_apply
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prefill hyper-connection read split over the attention group by tokens
+# ─────────────────────────────────────────────────────────────────────────────
+# Every rank computed the whole hyper-connection read (Qwen4ExpGatedResidual.forward -> hc_cte on > 32 rows) for all T
+# tokens of a prefill chunk: 95.5 ms of a 315 ms TP16 prefill (1,536 tokens) and 131.8 ms of a 376 ms TP32 prefill
+# (2,048) in device profiles, the same per rank at every TP. The read is per token (the norm, the low-rank gate, the
+# mean over the streams and the inject weights of token n read only row n of the streams; hc_cte splits the tokens over
+# its programs and nothing in it reduces over tokens), so the A ranks of the attention group (8 at TP 8 / 16 / 32) each
+# compute m rows and rebuild the T rows with collectives inside the group:
+#   rank r computes rows r*m .. r*m + m - 1 (rows past T are copies of real rows, never uninitialised memory), m = T / A
+#   rounded up to a multiple of _HCS_Q = 128 (so each LNC-2 program runs whole multiples of 64 rows, the per-program
+#   tile shapes of the prefill buckets already run on device; T = 1,536 at A = 8 gives m = 256 and ranks 6, 7 compute
+#   copies of the last rows), with hc_cte_sel (hc_cte reading the rank's rows itself by 64-row granule ids), then
+#   all-gathers mixed [m, H] and inject [m, hc] over the group along the rows (rank order = row order, two collectives)
+#   and drops the rows past T. The final mixer (no inject) gathers mixed alone.
+# Both results are gathered as whole, contiguous tensors, as hc_cte returns them unsplit. (One collective of the packed
+# [mixed | inject] buffer, sliced after it, made the rest of a TP16 2,048-token prefill ~98 ms slower on device: spill
+# reloads 10.9 -> 21.4 GB; an offline compile of the 48-layer prefill reproduced it and showed it gone with the two
+# gathers.) The rank's rows are selected by data (the group's rank_in_group tensor, a graph input), so every rank
+# traces the same graph. Applied when the step has T >= _HCS_MIN_T rows, T % 128 == 0 (prefill buckets; decode / verify
+# steps have fewer rows) and the attention group has A > 1 ranks; every other call, and every module not tagged with
+# _hcs_tp at model construction (model_bf16 and mtp.py tag theirs), goes to the replicated forward bound above.
+# Same kernel, same per-token math: the gathered rows equal the replicated call's rows bit for bit for finite inputs.
+from . import parallel as _hcs_par  # noqa: E402
+
+_HCS_Q = 128
+_HCS_MIN_T = 512  # the minimum tokens per step of the split
+_hc_forward_replicated = Qwen4ExpGatedResidual.forward  # = _drc_hc_forward(_hc_forward)
+
+
+def _hcs_rows(n: int, a: int) -> int:
+    """Rows per rank (a multiple of _HCS_Q, so > hc_fused.TKG_MAX_N = 32: the kernel path) of an n-row step over a ranks;
+    0 = not split."""
+    if a <= 1 or n < _HCS_MIN_T or n % _HCS_Q:
+        return 0
+    return -(-n // (a * _HCS_Q)) * _HCS_Q
+
+
+def _hcs_gather(loc: torch.Tensor, tp, n: int) -> torch.Tensor:
+    """[m, C] on every rank of ``tp`` -> [n, C]: rank r's rows at r * m (rank order), the rows past n dropped."""
+    return _hcs_par.tp_group(tp).all_gather(loc.contiguous(), dim=0)[:n]
+
+
+def _hcs_local(self, x2: torch.Tensor, n: int, m: int, tp):
+    """This rank's m rows of the read of ``x2`` [n, d]: ``(mixed [m, H], inject [m, hc] or None)``.
+
+    Rows r*m .. r*m + m - 1 of rank r; rows past n are copies of real rows (dropped by _hcs_gather). On the kernel path
+    (as _hc_forward: bf16, weights loaded, kernels available) hc_cte_sel reads them itself in 64-row granules (granule
+    ids past the last clamped to it); otherwise (CPU, other dtypes) an index_select of the rows (rows past n clamped to
+    row n - 1) feeds _hc_forward (the unchunked forward: m % 128 == 0)."""
+    d = x2.shape[-1]
+    rank = rank_tensor(tp, x2.device)
+    if self._hcf_ready and x2.dtype == torch.bfloat16 and _kernels_available(x2):
+        from vllm_neuron._kernels.qwen4_exp.hc_fused_sel import _SEL_G, hc_cte_sel
+
+        k = m // _SEL_G
+        gid = (rank * k + torch.arange(k, dtype=torch.int32, device=x2.device)).clamp(max=n // _SEL_G - 1)
+        mixed, w = _nki(hc_cte_sel)(x=x2.reshape(n // _SEL_G, _SEL_G, d), gid=gid.view(1, k), wd_t=self._hcf_wd_t,
+                                    wup_t=self._hcf_wup_t, w1=self._hcf_w1_cte, inj=self._hcf_inj_cte,
+                                    eps=self.hc_norm.eps, hc=self.hc)
+        return mixed, (w if self.block_inject_weight is not None else None)
+    rank = rank.long()
+    if tp.size * m == n:  # one contiguous [m, d] block per rank
+        x_loc = x2.reshape(tp.size, m * d).index_select(0, rank).reshape(m, d)
+    else:
+        x_loc = x2.index_select(0, (rank * m + torch.arange(m, device=x2.device)).clamp(max=n - 1))
+    out = _hc_forward(self, x_loc)
+    return (out, None) if self.block_inject_weight is None else (out[0], out[2])
+
+
+def _hcs_forward(self, streams: torch.Tensor):
+    tp = getattr(self, "_hcs_tp", None)
+    shape = streams.shape
+    d = shape[-1]
+    n = streams.numel() // d
+    m = _hcs_rows(n, tp.size) if tp is not None else 0
+    if not m:
+        return _hc_forward_replicated(self, streams)
+    mixed, w = _hcs_local(self, streams.reshape(n, d), n, m, tp)
+    if self.block_inject_weight is None:
+        return _hcs_gather(mixed, tp, n).reshape(*shape[:-1], self.hidden)
+    gm, gw = _hcs_gather(mixed, tp, n), _hcs_gather(w, tp, n)
+    return gm.reshape(*shape[:-1], self.hidden), streams, gw.reshape(*shape[:-1], self.hc)
+
+
+def _hcs_tag(model: nn.Module, tp) -> int:
+    """Tag every Qwen4ExpGatedResidual of ``model`` with the attention group ``tp``; returns how many."""
+    k = 0
+    for mod in model.modules():
+        if isinstance(mod, Qwen4ExpGatedResidual):
+            mod._hcs_tp = tp
+            k += 1
+    return k
+
+
+Qwen4ExpGatedResidual.forward = _hcs_forward
+
+
+# Rows per GDN decode step up to which ``Qwen4ExpGatedDeltaNet._decode_kernel`` uses ``gdn_tkg_act``; larger batches take
+# ``gdn_tkg``. On device the TP=16 decode graph of the 32-row batch bucket gave wrong outputs with ``gdn_tkg_act`` (GSM8K at
+# 32 concurrent requests: 0.04 vs 0.95 with ``gdn_tkg``), although the kernel alone matches ``gdn_tkg`` bit for bit at 32 rows in
+# the NKI simulator; at up to 16 rows it is verified on device (TP=16 at 16 concurrent requests, TP=8). Defined at the end of the
+# file so that no line above moves.
+_GDN_ACT_MAX_B = 16

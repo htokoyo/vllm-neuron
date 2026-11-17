@@ -894,3 +894,53 @@ class StateSnapshotDirectory:
         assert stored | free | pinned | inflight == set(range(self.num_rows)), "row leaked"
         assert {v: k for k, v in self._entries.items()} == self._hash_of_row
         assert sorted(self._current.values()) == sorted(self._pins.elements())
+
+
+# ── Host inputs joined right before the model call ────────────────────────────
+# A model whose per-step host inputs depend on the step's actual input ids (under async scheduling a device future
+# the runner only has when it calls the model) returns, from request_state_host_inputs, a host object under
+# JOIN_KEY (never sent to the device) and implements request_state_join_inputs(input_ids, attn_metadata, host). The
+# runner then calls join_host_inputs right before the model call (neuron_model_runner.install_request_state_join),
+# which adds the model's inputs to the step's request_state. Installed only by such a model (Qwen4-Exp with the
+# host-placed PLE table, vllm_neuron/model/qwen4_exp/ple_host.py), so every other configuration runs this module as
+# above.
+JOIN_KEY = "__join__"
+
+
+def _to_device_join(self, state_indices, has_init, num_valid, extras, snap_rows) -> dict:
+    extras = dict(extras)
+    join = extras.pop(JOIN_KEY, None)
+    md = _to_device_before_join(self, state_indices, has_init, num_valid, extras, snap_rows)
+    # The step's host arrays travel with the request_state dict they belong to (checked by identity in the join).
+    self._join_pending = None if join is None else (md, dict(
+        state_indices=state_indices, has_initial_state=has_init, num_valid=num_valid, join=join))
+    return md
+
+
+def join_host_inputs(self, input_ids, attn_metadata, input_batch=None) -> int:
+    """Add the model's joined inputs to ``attn_metadata["request_state"]`` (right before the model call).
+
+    ``input_ids`` is what the runner passes to the model, before its upload (a device future under async
+    scheduling); ``input_batch`` is the runner's InputBatch (its token table and write cursors, which the runner has
+    brought up to date on this rank before the call). Returns the number of tensors added (0 when the step has
+    nothing to join, e.g. warm-up inputs)."""
+    md = attn_metadata.get(REQUEST_STATE_KEY) if isinstance(attn_metadata, dict) else None
+    pending = getattr(self, "_join_pending", None)
+    if md is None or pending is None:
+        return 0
+    if pending[0] is not md:
+        raise RuntimeError("request_state to join is not the one the last runtime_metadata built")
+    self._join_pending = None
+    extras = self.model.request_state_join_inputs(input_ids, attn_metadata, dict(pending[1], input_batch=input_batch))
+    md.update({k: v.to(self.device) for k, v in extras.items()})
+    return len(extras)
+
+
+def install_join() -> None:
+    """Route the per-step host objects of request_state_host_inputs to :func:`join_host_inputs` (idempotent)."""
+    global _to_device_before_join
+    if getattr(RequestStateSlots, "join_host_inputs", None) is join_host_inputs:
+        return
+    _to_device_before_join = RequestStateSlots._to_device
+    RequestStateSlots._to_device = _to_device_join
+    RequestStateSlots.join_host_inputs = join_host_inputs

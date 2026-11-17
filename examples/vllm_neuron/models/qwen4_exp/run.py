@@ -10,8 +10,9 @@ residual, an n-gram per-layer embedding and one MTP layer. Text path only.
 
 Builds the primary configuration of the bundle README (Qwen3.8-Flash-Next/README.md): one TP=32
 replica with expert parallelism (ep_degree 4, attention in groups of 8 ranks), max_model_len 2,048,
-MTP k=2, async scheduling. The model needs no environment knobs; the runtime / compile settings of the
-README's Step 1 are applied via os.environ.setdefault() below, so an explicit export still wins. Set the
+MTP k=2, async scheduling, prefix caching on. The model needs no environment knobs; the runtime / compile
+settings of the README's Step 1 and NEURON_RT_IO_RING_CACHE_SIZE=4 are applied via os.environ.setdefault()
+below, so an explicit export still wins. Set the
 compile-cache variables (VLLM_CACHE_ROOT, NKI_COMPILE_CACHE_URL) yourself; the first run compiles every
 graph.
 """
@@ -21,9 +22,11 @@ import os
 # Runtime / compile settings of the README's Step 1 (set before importing vllm).
 _ENV = {
     # KV-cache share of free HBM (the measured value; a larger share leaves too little for a batch).
-    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.09",
+    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": "0.07",
     # Host path: keep the step readers spinning for the length of a decode step.
     "VLLM_NEURON_SHM_READER_BUSY_LOOP_S": "0.02",
+    # Runtime IO ring cache (set in every serve command of the README).
+    "NEURON_RT_IO_RING_CACHE_SIZE": "4",
     # A cold TP=32 compile: bounded compile pool, compile lock and rank barrier longer than the build.
     "NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS": "20",
     "TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT": "14400",
@@ -64,8 +67,8 @@ def main():
         max_num_batched_tokens=PREFILL_BUCKETS[-1],
         max_num_seqs=args.max_num_seqs,
         block_size=32,
-        # Prefix caching stays off in this example (it is on by default for vllm serve; README: Prefix caching).
-        enable_prefix_caching=False,
+        # Prefix caching on, as in the measured serve command (README: Prefix caching).
+        enable_prefix_caching=True,
         async_scheduling=True,
         # Text path only: the checkpoint's vision tower is not built.
         limit_mm_per_prompt={"image": 0, "video": 0},

@@ -982,3 +982,85 @@ def _request_state_pools(self):
 
 
 Qwen4ExpForCausalLM.request_state_pools = _request_state_pools
+
+
+# ── GDN recurrent-state read ─────────────────────────────────────────────────────────────────────────────────────
+# _pool_rows above flattens every pool; the fp32 [n, H, K, V] recurrent-state row then sits on one partition and
+# neuronx-cc copies it in 4 KB pieces: ~97 DMAs and ~81 us per row and layer, 42 % of a TP16 B=8 decode step on device.
+# index_select on the 4-D pool keeps [H * K, V] on the partitions: one DMA in and one out per row, like _pool_write. The
+# 3-D conv pools keep the flat read (a [n, 128, F] view made the PLE conv read slower).
+#
+# Where NKI kernels run (device, or the NKI simulator), the 4-D pools are read by state_rows_tkg instead
+# (_kernels/qwen4_exp/state_rows.py: one hardware-DGE DMA per row and LNC program, issued by the Sync engine). The
+# index_select's software-DGE DMAs are issued by GpSimd in order with every state-pool write, and in some decode graphs
+# the read of a GDN layer was placed among the pool writes and gdn_tkg waited for it (+5.8 ms per step in a TP16 B=16
+# decode profile). A byte copy, so outputs and pools are bit-identical. Every graph that reads a 4-D pool (decode, MTP
+# verify, prefill) takes the kernel, up to _SRE_MAX_ROWS rows per read (0 = no limit); larger reads take the
+# index_select.
+_pool_rows_flat = _pool_rows
+
+# Row limit of the kernel read at TP >= 32 (a measured choice; below TP 32 there is no limit). TP32 MTP verify after a
+# 1,635-token prompt: the kernel read made the step 4.0 / 2.5 ms faster at B=2 / 4 but 1.1 / 1.6 ms slower at B=8 / 16
+# (inferred: at B >= 8 the per-row reads on the Sync queue sit behind the all-expert MoE weight stream, which the same
+# queue issues).
+_SRE_MAX_ROWS_TP32 = 0
+_SRE_MAX_ROWS = 0  # set by TP degree at model construction (_qwen4_exp_tp_init)
+
+
+def _pool_rows_4d(pool, slots, b):
+    """Rows ``slots[:b]`` of a 4-D pool by index_select on the pool itself (no flattening)."""
+    if b > 1:
+        return torch.cat([pool.index_select(0, slots[j : j + 1]) for j in range(b)])
+    return pool.index_select(0, slots[:1])
+
+
+def _pool_rows(pool, slots, b):  # noqa: F811
+    if pool.dim() != 4:
+        return _pool_rows_flat(pool, slots, b)
+    if (_SRE_MAX_ROWS and b > _SRE_MAX_ROWS) or not _ple_layers._kernels_available(pool):
+        return _pool_rows_4d(pool, slots, b)
+    from vllm_neuron._kernels.qwen4_exp.state_rows import state_rows_tkg
+
+    return _ple_layers._nki(state_rows_tkg)(pool=pool, slots=slots[:b].to(torch.int32).reshape(b, 1))
+
+
+# ── Options that depend on the tensor-parallel degree ──────────────────────────────────────────────────────────────
+# Set once, when the model is constructed (before any graph is traced), from the current vLLM config's
+# tensor_parallel_size (TP 32 when no vLLM config is in scope, e.g. a model built outside the runner):
+#   fused sparse decode MoE (layers.Qwen4ExpSparseMoe, moe_block_tkg): decode and verify steps of up to 4 rows at
+#       TP >= 32, 16 at TP 16, 32 at TP <= 8; larger steps take the all-expert path (32 rows at TP 32, and at TP 16 on
+#       Neuron 2.33.1, fail to compile: NCC_IINAR001).
+#   one copy of the hyper-connection transposes (layers._hca_fill, -1.18 GiB per rank): below TP 32, where the weights
+#       need the room.
+#   the PLE n-gram table: on the device (row-sharded) at TP >= 32, in host memory below TP 32 (ple_host.py: a class swap
+#       of this model and of its Qwen4ExpNGramEmbedding modules).
+#   the row limit of the state_rows_tkg read (_SRE_MAX_ROWS above).
+# Every hyper-connection read of the model is tagged with the attention group (layers._hcs_forward: the prefill read
+# split by tokens over the group).
+def _tp_degree() -> int:
+    try:
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+    except Exception:  # no vLLM config in scope: TP 32
+        return 32
+    pc = getattr(vllm_config, "parallel_config", None)
+    return int(getattr(pc, "tensor_parallel_size", 32) or 32)
+
+
+def _qwen4_exp_tp_init(self, config):
+    global _SRE_MAX_ROWS
+    tp = _tp_degree()
+    _ple_layers._MOE_BLOCK_FUSED_MAX_T = 4 if tp >= 32 else 16 if tp >= 16 else 32
+    _ple_layers._HCA_ON = tp < 32
+    _SRE_MAX_ROWS = _SRE_MAX_ROWS_TP32 if tp >= 32 else 0
+    _qwen4_exp_tp_orig_init(self, config)
+    _ple_layers._hcs_tag(self, self.config.attn_tp)
+    if tp < 32:
+        from . import ple_host
+
+        ple_host.enable(self)
+
+
+_qwen4_exp_tp_orig_init = Qwen4ExpForCausalLM.__init__
+Qwen4ExpForCausalLM.__init__ = _qwen4_exp_tp_init

@@ -3,15 +3,16 @@
 <!-- meta: description: Model recipe for deploying Qwen3.8-Flash-Next with vLLM on
 Neuron: a hybrid gated-DeltaNet / sparse-attention Mixture-of-Experts model served from
 its FP8 checkpoint as one TP=32 replica on trn2.48xlarge, text only, with MTP
-speculative decoding and an opt-in 81,920-token configuration. Pointer to the
+speculative decoding and an opt-in 81,920-token configuration; four TP=16 or eight TP=8
+replicas serve for throughput. Pointer to the
 consolidated Qwen3.8-Flash-Next port README, which is the single source of truth for
 architecture, the FP8 path, configuration, long context, verification, and performance
 on Trn2. -->
 <!-- meta: keywords: vLLM, Neuron, Qwen3.8, Qwen3.8-Flash-Next, Qwen3.8-Flash-Next-FP8,
 qwen4_exp, MoE, expert parallelism, FP8, gated DeltaNet, linear attention, hybrid,
-sparse attention, MTP, speculative decoding, async scheduling, long context, model
+sparse attention, MTP, speculative decoding, async scheduling, data parallel, TP16, TP8, long context, model
 recipe, model card, LLM serving, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-11-09 -->
+<!-- meta: date_updated: 2026-11-17 -->
 <!-- Content type: model-card -->
 
 > **The full model recipe for [`Qwen/Qwen3.8-Flash-Next-FP8`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8) lives in the port's consolidated README, which is the
