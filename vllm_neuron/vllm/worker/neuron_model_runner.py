@@ -2861,7 +2861,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 sampling_params
                 and sampling_params.sampling_type == SamplingType.RANDOM_SEED
             ):
-                generator = torch.Generator(device=self.device)
+                # A CPU generator: torch has no Generator for the neuron device (PrivateUse1 has no
+                # getNewGenerator), so a device generator raised NotImplementedError in the engine loop
+                # and took the server down on the first request with a per-request seed. The on-device
+                # sampler does not consume it.
+                generator = torch.Generator(device="cpu")
                 generator.manual_seed(sampling_params.seed)
             else:
                 generator = None
