@@ -1270,6 +1270,10 @@ def _gdn_verify_multi_unchunked(la: Qwen4ExpGatedDeltaNet, x: torch.Tensor, stat
 # three extra buffers per MoE layer filled after load_state_dict (+2.9 MB per layer per rank). Installed by
 # patching Qwen4ExpSparseMoe below; larger decode batches, prefill and CPU (no kernel) take the original forward.
 _MOE_BLOCK_FUSED_MAX_T = 4  # set by TP degree at model construction (model_bf16._qwen4_exp_tp_init)
+# FP8 decode / verify steps of _MOE_BLOCK_FUSED_MAX_T < rows <= _MOE_BLOCK_CHUNKED_MAX_T run the fused kernel on row
+# chunks of _MOE_BLOCK_FUSED_MAX_T rows (one all-reduce for the step); larger steps take the all-expert path. 0: off.
+_MOE_BLOCK_CHUNKED_MAX_T = 0  # set at model construction (model_bf16._qwen4_exp_tp_init)
+_MOE_BLOCK_ROW_TILE = False  # one kernel call with in-kernel row tiles above 32 rows (model_bf16._qwen4_exp_tp_init)
 
 
 def _moe_block_fill(moe: "Qwen4ExpSparseMoe", *_args) -> None:
@@ -1579,7 +1583,8 @@ def _moe_block_init_fp8(self, config, use_kernels=False):
 def _moe_block_forward_fp8(self, x: torch.Tensor, is_decode: bool = False) -> torch.Tensor:
     shape = x.shape
     t = x.numel() // shape[-1]
-    if not (self.use_kernels and is_decode and 0 < t <= _MOE_BLOCK_FUSED_MAX_T and self.tp.size > 1
+    max_rows = max(_MOE_BLOCK_FUSED_MAX_T, _MOE_BLOCK_CHUNKED_MAX_T)
+    if not (self.use_kernels and is_decode and 0 < t <= max_rows and self.tp.size > 1
             and _kernels_available(x)):
         return _moe_block_orig_forward(self, x, is_decode)
     from vllm_neuron._kernels.qwen4_exp.moe_block_tkg_pf import moe_block_tkg_fp8_pf
@@ -1588,10 +1593,24 @@ def _moe_block_forward_fp8(self, x: torch.Tensor, is_decode: bool = False) -> to
     x2 = x.reshape(t, shape[-1])
     e, h, two_i = ex.gate_up_proj.shape
     rank = rank_tensor(self.tp, x.device).reshape(1, 1)
-    out = _nki(moe_block_tkg_fp8_pf)(
-        x=x2, router_wt=self._mbf_router_wt, gate_up=ex.gate_up_proj.view(e, h, 2, two_i // 2), down=ex.down_proj,
-        gate_up_scale_t=self._mbf_gu_scale_t, down_scale=ex.down_scale.view(e, h), shared_gu=self._mbf_shared_gu,
-        shared_down=self._mbf_shared_down, rank_id=rank, top_k=self.top_k, with_shared=bool(self.shard_shared))
+
+    def fused(rows):
+        return _nki(moe_block_tkg_fp8_pf)(
+            x=rows, router_wt=self._mbf_router_wt, gate_up=ex.gate_up_proj.view(e, h, 2, two_i // 2), down=ex.down_proj,
+            gate_up_scale_t=self._mbf_gu_scale_t, down_scale=ex.down_scale.view(e, h), shared_gu=self._mbf_shared_gu,
+            shared_down=self._mbf_shared_down, rank_id=rank, top_k=self.top_k, with_shared=bool(self.shard_shared))
+
+    # Steps above the fused row limit: with _MOE_BLOCK_ROW_TILE the kernel takes all rows in one call (row tiles of
+    # <= 32 inside the kernel, each routed expert's weights read once per step); otherwise row chunks of at most
+    # _MOE_BLOCK_FUSED_MAX_T rows, one kernel call each. The partial sums go to ONE all-reduce. Rows are independent:
+    # both give the per-row result of the <= 32-row kernel (bit-identical in the NKI simulator).
+    c = _MOE_BLOCK_FUSED_MAX_T
+    if t <= c:
+        out = fused(x2)
+    elif _MOE_BLOCK_ROW_TILE and t <= 128:
+        out = fused(x2)
+    else:
+        out = torch.cat([fused(x2[i : min(t, i + c)]) for i in range(0, t, c)])
     out = all_reduce(out, self.tp)
     if not self.shard_shared:
         out = out + torch.sigmoid(self.shared_expert_gate(x2)) * self.shared_expert(x2)
@@ -2318,7 +2337,21 @@ import vllm_neuron.functional.topk as _drc_topk  # noqa: E402
 
 Qwen4ExpGatedResidual.forward = _drc_hc_forward(Qwen4ExpGatedResidual.forward)
 Qwen4ExpSparseMoe.forward = _drc_moe_forward(Qwen4ExpSparseMoe.forward)
-_moe_block_forward_fp8 = _drc_moe_forward(_moe_block_forward_fp8)  # instance forward of the fused FP8 MoE init
+def _drc_moe_fp8_forward(fn):
+    """_drc_moe_forward for the fused FP8 MoE, except for the steps that _moe_block_forward_fp8 itself takes as one
+    step (up to _MOE_BLOCK_CHUNKED_MAX_T rows: one all-reduce, the fused kernel on row chunks or row tiles)."""
+    chunked = _drc_moe_forward(fn)
+
+    def forward(self, x: torch.Tensor, is_decode: bool = False) -> torch.Tensor:
+        n = x.numel() // x.shape[-1]
+        if is_decode and 0 < n <= _MOE_BLOCK_CHUNKED_MAX_T:
+            return fn(self, x, is_decode)
+        return chunked(self, x, is_decode)
+
+    return forward
+
+
+_moe_block_forward_fp8 = _drc_moe_fp8_forward(_moe_block_forward_fp8)  # instance forward of the fused FP8 MoE init
 _moe_block_orig_forward = _drc_moe_forward(_moe_block_orig_forward)  # the FP8 init's instance forward (no-op inside chunks)
 Qwen4ExpAttention._qkv = _drc_qkv(Qwen4ExpAttention._qkv)
 _atf_o_proj_forward = _drc_atf_o_proj_forward(_atf_o_proj_forward)  # used by _atf_init

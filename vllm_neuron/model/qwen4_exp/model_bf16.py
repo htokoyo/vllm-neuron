@@ -1048,10 +1048,34 @@ def _tp_degree() -> int:
     return int(getattr(pc, "tensor_parallel_size", 32) or 32)
 
 
+def _moe_fused_max_t(tp: int) -> int:
+    """Rows per fused decode-MoE call (layers._MOE_BLOCK_FUSED_MAX_T, <= 32); env VLLM_NEURON_QWEN4_MOE_FUSED_MAX_T
+    overrides the default."""
+    import os
+
+    env = os.environ.get("VLLM_NEURON_QWEN4_MOE_FUSED_MAX_T")
+    if env is not None:
+        return min(32, int(env))
+    return 4 if tp >= 32 else 16 if tp >= 16 else 32
+
+
+def _moe_chunked_max_t(tp: int) -> int:
+    """Row limit of the chunked fused decode MoE (layers._MOE_BLOCK_CHUNKED_MAX_T); env
+    VLLM_NEURON_QWEN4_MOE_CHUNK_MAX_T overrides the default."""
+    import os
+
+    env = os.environ.get("VLLM_NEURON_QWEN4_MOE_CHUNK_MAX_T")
+    if env is not None:
+        return int(env)
+    return 0
+
+
 def _qwen4_exp_tp_init(self, config):
     global _SRE_MAX_ROWS
     tp = _tp_degree()
-    _ple_layers._MOE_BLOCK_FUSED_MAX_T = 4 if tp >= 32 else 16 if tp >= 16 else 32
+    _ple_layers._MOE_BLOCK_FUSED_MAX_T = _moe_fused_max_t(tp)
+    _ple_layers._MOE_BLOCK_CHUNKED_MAX_T = _moe_chunked_max_t(tp)
+    _ple_layers._MOE_BLOCK_ROW_TILE = __import__("os").environ.get("VLLM_NEURON_QWEN4_MOE_ROWTILE", "0") == "1"
     _ple_layers._HCA_ON = tp < 32
     _SRE_MAX_ROWS = _SRE_MAX_ROWS_TP32 if tp >= 32 else 0
     _qwen4_exp_tp_orig_init(self, config)
