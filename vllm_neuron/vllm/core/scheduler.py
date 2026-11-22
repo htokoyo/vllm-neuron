@@ -1563,12 +1563,17 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
             request.num_output_placeholders += 1 + cur_num_spec_tokens
             if not is_spec:
                 continue
-            # Sticky: once disabled for this request, stay disabled.
-            disabled = getattr(request, "_async_spec_disabled", False)
-            if not disabled and request.num_computed_tokens > safe_num_computed:
-                disabled = True
-                request._async_spec_disabled = True
-            if disabled:
-                request.spec_token_ids = []
-            else:
-                request.spec_token_ids = self._spec_token_placeholders
+            # Near max_model_len the request would have to leave spec decode, and the spec <->
+            # non-spec transitions of a running async batch are not safe: with 2 concurrent
+            # requests the near-limit one was never scheduled again ("Running: 1 reqs", an
+            # abort did not free it); with 4-8 the engine stalled or raised "Missing async spec
+            # transition drafts". Instead every request ends inside the spec-safe range: its
+            # output is capped once at max_model_len - 3 - 2k total tokens (finish_reason
+            # "length", at most 3 + 2k tokens before max_model_len), so drafting is never
+            # turned off for a running request and every decode step stays uniform.
+            if not getattr(request, "_async_spec_capped", False):
+                request._async_spec_capped = True
+                limit = safe_num_computed + 1 - request.num_prompt_tokens
+                if request.max_tokens > limit:
+                    request.max_tokens = max(limit, 1)
+            request.spec_token_ids = self._spec_token_placeholders
