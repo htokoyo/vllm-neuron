@@ -46,6 +46,7 @@ from vllm_neuron.utils.neuron_utils import in_lane_grad_mode
 from vllm_neuron.utils.hardware_config import (
     get_efa_interface,
     get_logical_cores_per_hbm_stack,
+    get_neuron_device_numa_node,
     parse_range_list,
 )
 from vllm.utils.network_utils import get_open_port
@@ -593,7 +594,7 @@ class NeuronWorker(WorkerBase):
         )
         return efa
 
-    def _set_cpu_affinity(self) -> None:
+    def _set_cpu_affinity(self, visible_devices=None) -> None:
         """
         Set CPU affinity for all threads based on EFA's NUMA node.
 
@@ -602,15 +603,25 @@ class NeuronWorker(WorkerBase):
         This is critical for both single-instance and disaggregated inference workloads.
 
         Queries the EFA interface name from the FI_EFA_IFACE environment variable.
+        Without an EFA interface (instances launched without EFA, or
+        NEURON_SKIP_EFA_AFFINITY=1) the NUMA node is read from the PCI sysfs entry of
+        this worker's Neuron device (hardware_config.get_neuron_device_numa_node).
         """
         efa = os.environ.get("FI_EFA_IFACE")
         numa_node_path = (
             f"/sys/class/infiniband/{efa}/device/numa_node" if efa else None
         )
-
+        numa = None
+        source = None
         if efa and numa_node_path and os.path.exists(numa_node_path):
-            with open(f"/sys/class/infiniband/{efa}/device/numa_node") as f:
+            with open(numa_node_path) as f:
                 numa = int(f.read())
+            source = f"EFA device {efa}"
+        elif visible_devices is not None:
+            numa = get_neuron_device_numa_node(self.local_rank, visible_devices)
+            source = "Neuron device PCI sysfs (no EFA)"
+
+        if numa is not None and numa >= 0:
             with open(f"/sys/devices/system/node/node{numa}/cpulist") as f:
                 cpulist = parse_range_list(f.read())
 
@@ -641,15 +652,17 @@ class NeuronWorker(WorkerBase):
                 os.sched_setaffinity(0, cpulist)
                 threads_set = 1
 
-            logger.debug(
-                "Set CPU affinity for %s thread(s) to NUMA node %s, CPUs: %s",
+            logger.info(
+                "Set CPU affinity for %s thread(s) to NUMA node %s (from %s)",
                 threads_set,
                 numa,
-                cpulist,
+                source,
             )
         else:
             logger.warning(
-                "EFA device %s not found, skipping CPU affinity settings", efa
+                "EFA device %s not found and no NUMA node for the Neuron device, "
+                "skipping CPU affinity settings",
+                efa,
             )
 
     def init_device(self) -> None:
@@ -882,8 +895,14 @@ class NeuronWorker(WorkerBase):
             visible_devices = self._get_visible_devices()
 
             if os.environ.get("NEURON_SKIP_EFA_AFFINITY", "0") == "0":
-                self._set_efa_affinity(visible_devices)
-            self._set_cpu_affinity()
+                try:
+                    self._set_efa_affinity(visible_devices)
+                except RuntimeError as e:
+                    # No EFA interface (e.g. launched with plain ENIs): EFA affinity only
+                    # selects the interface and its NUMA node; the CPU affinity below then
+                    # takes the Neuron device's own NUMA node.
+                    logger.warning("EFA affinity skipped: %s", e)
+            self._set_cpu_affinity(visible_devices)
 
             # Set visible cores and platform device count. The worker thread
             # has one visible core, while the platform device count is the

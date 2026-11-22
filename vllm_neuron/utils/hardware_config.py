@@ -325,6 +325,47 @@ def get_efa_interface(local_rank: int, visible_devices: list[int]) -> str:
     return get_efa_interface_from_bdf(bdf)
 
 
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def get_neuron_device_numa_node(local_rank: int, visible_devices: list[int]) -> int | None:
+    """
+    NUMA node of the Neuron device that serves ``local_rank``, without EFA.
+
+    Resolves logical core -> Neuron device -> host device -> PCI slot (the EFA BDF mapping of the instance
+    family), then reads the NUMA node from PCI sysfs: the slot's own device when it exists, else the PCI bus
+    that holds the slot (``/sys/class/pci_bus/<domain:bus>/device/numa_node``). The bus is present on
+    instances launched without EFA network interfaces, and it sits under the same root port as the Neuron
+    device, so it reports the device's NUMA node.
+
+    Returns:
+        int | None: The NUMA node, or None if it cannot be determined (unknown instance family, no sysfs
+            entry, or a negative ``numa_node``, which the kernel reports when there is no NUMA information).
+    """
+    try:
+        lnc = visible_devices[local_rank]
+    except IndexError:
+        lnc = local_rank
+    nd = lnc * get_logical_nc_config() // 8
+    try:
+        host_nd = os.minor(os.stat(f"/dev/neuron{nd}").st_rdev)
+        bdf = get_efa_bdf_mapping()[host_nd]
+    except (OSError, RuntimeError, ValueError, IndexError) as e:
+        logger.debug("No PCI slot for Neuron device %s: %s", nd, e)
+        return None
+    bus = bdf.rsplit(":", 1)[0]  # "0000:c9:00.0" -> "0000:c9"
+    for path in (f"/sys/bus/pci/devices/{bdf}/numa_node", f"/sys/class/pci_bus/{bus}/device/numa_node"):
+        numa = _read_int(path)
+        if numa is not None and numa >= 0:
+            return numa
+    return None
+
+
 def parse_range_list(range_list_str: str) -> list[int]:
     """
     Parse a range list string into a list of integers.
