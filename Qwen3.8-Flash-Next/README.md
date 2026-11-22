@@ -276,7 +276,7 @@ each falls back to its PyTorch path.
 | Path | What it does |
 |---|---|
 | Prefill MoE | Skips the compute of empty expert blocks (dynamic block loop in a copy of the nki-library MoE CTE kernel) |
-| Decode MoE, up to 4 / 16 / 32 rows at TP=32 / 16 / 8 | Router, top-k, routed experts (FP8 or BF16, from the checkpoint) and the shared expert in one kernel; larger steps take the all-expert path (32 rows at TP=32, and at TP=16 on Neuron 2.33.1, do not compile) |
+| Decode MoE, up to 128 / 64 / 32 rows at TP=32 / 16 / 8 (FP8 checkpoint) | Router, top-k, routed experts (FP8 or BF16, from the checkpoint) and the shared expert in one kernel, one all-reduce per step; above 32 rows at TP=32 the kernel runs row tiles of 32 and loads each routed expert once per step, at TP=16 it runs 16-row calls; TP=8 steps above 32 rows run as 32-row chunks |
 | Decode MoE, FP8 experts | The fused kernel pipelines the routed experts in one loop body: two experts per iteration with both weight loads issued first, and every expert's scales loaded once per layer |
 | Decode attention projections, ≤ 32 rows | q / k / v projection, q / k norm and partial RoPE, and o_proj in NKI kernels |
 | Recurrent-state read | Each request's DeltaNet recurrent state is read from the 4-D pool `[slots, heads, k, v]` one row per DMA, by an NKI kernel whose DMAs the Sync engine issues, so the read does not wait behind the state-pool writes; a byte copy |
@@ -610,9 +610,10 @@ The last column is the previous revision of this README (Neuron 2.33, KV-cache s
 whose B=1 TTFT was 0.123 s with the short prompt and 0.379 s with the long one. There, B=4 × 1,635-token prompts
 did not fit.
 
-The time per output token rises most from B=1 to B=2. The fused decode-MoE kernel covers up to four rows per step
-at TP=32, which is the B=1 MTP verify step (1 + k = 3 rows); at B=2 the verify step has six rows and the MoE takes
-the all-expert path, which is the most likely reason for the jump.
+The time per output token rises most from B=1 to B=2 in the table above (measured when the fused decode-MoE kernel
+covered only four rows per step at TP=32, so a B=2 verify step of six rows took the all-expert path). With the fused
+kernel extended to 128 rows, `vllm bench serve` random 1024/512 on one TP=32 replica gives a time per output token
+of 10.1 / 12.5 / 16.9 / 21.6 ms at concurrency 1 / 2 / 4 / 8 (it was 10.8 / 26.7 / 28.4 / 24.9 ms).
 
 Batches with padding rows (3, 5 and 7 concurrent 30-token requests, so the batch graphs carry padding rows;
 previous revision) give no degenerate output; 13 of the 15 outputs equal the same prompt served alone, and the

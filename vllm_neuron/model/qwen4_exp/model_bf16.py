@@ -1027,9 +1027,12 @@ def _pool_rows(pool, slots, b):  # noqa: F811
 # ── Options that depend on the tensor-parallel degree ──────────────────────────────────────────────────────────────
 # Set once, when the model is constructed (before any graph is traced), from the current vLLM config's
 # tensor_parallel_size (TP 32 when no vLLM config is in scope, e.g. a model built outside the runner):
-#   fused sparse decode MoE (layers.Qwen4ExpSparseMoe, moe_block_tkg): decode and verify steps of up to 4 rows at
-#       TP >= 32, 16 at TP 16, 32 at TP <= 8; larger steps take the all-expert path (32 rows at TP 32, and at TP 16 on
-#       Neuron 2.33.1, fail to compile: NCC_IINAR001).
+#   fused sparse decode MoE (layers.Qwen4ExpSparseMoe, moe_block_tkg): FP8 decode and verify steps of up to 128 rows
+#       at TP >= 32 (one call; above 32 rows in-kernel row tiles of 32, each routed expert loaded once per step) and up
+#       to 64 rows at TP 16 (16-row fused calls), each with ONE all-reduce; TP <= 8 as before (32 rows per call, larger
+#       steps in the 32-row chunks of _DECODE_ROW_CHUNK). The all-expert moe_tkg (32 rows at TP 32 / 16 failed to
+#       compile: NCC_IINAR001) is no longer on the FP8 decode path at these row counts. Env overrides:
+#       VLLM_NEURON_QWEN4_MOE_FUSED_MAX_T / _CHUNK_MAX_T / _ROWTILE.
 #   one copy of the hyper-connection transposes (layers._hca_fill, -1.18 GiB per rank): below TP 32, where the weights
 #       need the room.
 #   the PLE n-gram table: on the device (row-sharded) at TP >= 32, in host memory below TP 32 (ple_host.py: a class swap
@@ -1056,7 +1059,7 @@ def _moe_fused_max_t(tp: int) -> int:
     env = os.environ.get("VLLM_NEURON_QWEN4_MOE_FUSED_MAX_T")
     if env is not None:
         return min(32, int(env))
-    return 4 if tp >= 32 else 16 if tp >= 16 else 32
+    return 32 if tp >= 32 else 16 if tp >= 16 else 32  # the configurations measured on device
 
 
 def _moe_chunked_max_t(tp: int) -> int:
@@ -1067,7 +1070,9 @@ def _moe_chunked_max_t(tp: int) -> int:
     env = os.environ.get("VLLM_NEURON_QWEN4_MOE_CHUNK_MAX_T")
     if env is not None:
         return int(env)
-    return 0
+    # TP 32: up to 128 rows (MTP verify at max_num_seqs 32 is 96); TP 16: up to 64; TP <= 8: off (neutral on device,
+    # 64 rows already ran as two 32-row fused calls through _DECODE_ROW_CHUNK)
+    return 128 if tp >= 32 else 64 if tp >= 16 else 0
 
 
 def _qwen4_exp_tp_init(self, config):
@@ -1075,7 +1080,9 @@ def _qwen4_exp_tp_init(self, config):
     tp = _tp_degree()
     _ple_layers._MOE_BLOCK_FUSED_MAX_T = _moe_fused_max_t(tp)
     _ple_layers._MOE_BLOCK_CHUNKED_MAX_T = _moe_chunked_max_t(tp)
-    _ple_layers._MOE_BLOCK_ROW_TILE = __import__("os").environ.get("VLLM_NEURON_QWEN4_MOE_ROWTILE", "0") == "1"
+    # row tiles in one kernel call above 32 rows at TP 32 (measured); TP 16 runs 16-row chunks (measured)
+    _ple_layers._MOE_BLOCK_ROW_TILE = __import__("os").environ.get(
+        "VLLM_NEURON_QWEN4_MOE_ROWTILE", "1" if tp >= 32 else "0") == "1"
     _ple_layers._HCA_ON = tp < 32
     _SRE_MAX_ROWS = _SRE_MAX_ROWS_TP32 if tp >= 32 else 0
     _qwen4_exp_tp_orig_init(self, config)
