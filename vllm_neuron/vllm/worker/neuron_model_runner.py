@@ -8686,7 +8686,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             return
 
-        req_ids = list(scheduler_output.scheduled_spec_decode_tokens.keys())
+        # Every scheduled request, not only those with drafts: the fill step
+        # (_fill_transition_input_and_spec_metadata_from_cache) reads a cached
+        # row for each row of the input batch, including a request scheduled
+        # with 0 drafts (e.g. one that stopped drafting near max_model_len),
+        # and raises if it is missing.
+        req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         num_draft_tokens = [
             len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
             for req_id in req_ids
