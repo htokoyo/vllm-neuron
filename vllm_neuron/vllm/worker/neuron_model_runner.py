@@ -11830,3 +11830,104 @@ def install_request_state_join() -> None:
     _snapshot_capture_context_before_join = NeuronModelRunner._snapshot_capture_context
     NeuronModelRunner._execute_model_forward = _execute_model_forward_join
     NeuronModelRunner._snapshot_capture_context = _snapshot_capture_context_join
+
+
+# ── Per-step host timing (VLLM_NEURON_STEP_LOG=<path>; default off) ────────────────────────────────────────────────
+# Rank 0 of each runner process appends one line per step to <path>.runner: wall time, then ms spent in
+#   prep   _prepare_model_input (host input preparation and upload)
+#   wait   _join_materialize_previous_output (async scheduling: waiting for the previous step's sampled tokens, i.e.
+#          for the device; only where the request-state join is installed, Qwen4-Exp below TP 32)
+#   join   RequestStateSlots.join_host_inputs (the host n-gram gather and its upload)
+#   fwd    _execute_model_forward (graph launch; with async execution the device time is not in here)
+#   exec   execute_model in total
+#   samp   sample_tokens
+# and the step's scheduled requests / tokens. The scheduler process logs the step interval to <path> (scheduler.py).
+# Installed only when the variable is set, so the runner is unchanged otherwise.
+def _install_runner_step_log(path: str) -> None:
+    import functools
+    import threading
+
+    tls = threading.local()
+
+    def acc(key, fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            t0 = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                d = getattr(tls, "d", None)
+                if d is not None:
+                    d[key] = d.get(key, 0.0) + (time.perf_counter() - t0) * 1e3
+        return wrapped
+
+    g = globals()
+    NeuronModelRunner._prepare_model_input = acc("prep", NeuronModelRunner._prepare_model_input)
+    NeuronModelRunner._execute_model_forward = acc("fwd", NeuronModelRunner._execute_model_forward)
+    if "_join_materialize_previous_output" in g:
+        g["_join_materialize_previous_output"] = acc("wait", g["_join_materialize_previous_output"])
+    try:
+        from vllm_neuron.vllm.worker import request_state as _rs
+
+        _rs.join_host_inputs = acc("join", _rs.join_host_inputs)
+        if getattr(_rs.RequestStateSlots, "join_host_inputs", None) is not None:
+            _rs.RequestStateSlots.join_host_inputs = _rs.join_host_inputs
+        _install_join_orig = _rs.install_join
+
+        def install_join():
+            _install_join_orig()
+            _rs.RequestStateSlots.join_host_inputs = _rs.join_host_inputs
+
+        _rs.install_join = install_join
+    except Exception:  # pragma: no cover - logging aid only
+        pass
+
+    exec_orig = NeuronModelRunner.execute_model
+    samp_orig = NeuronModelRunner.sample_tokens
+    state = {"f": None, "rank0": None}
+
+    def is_rank0():
+        if state["rank0"] is None:
+            try:
+                state["rank0"] = get_tp_group().rank_in_group == 0
+            except Exception:
+                state["rank0"] = True
+        return state["rank0"]
+
+    def execute_model(self, scheduler_output, *args, **kwargs):
+        if not is_rank0():
+            return exec_orig(self, scheduler_output, *args, **kwargs)
+        tls.d = {}
+        t0 = time.perf_counter()
+        try:
+            return exec_orig(self, scheduler_output, *args, **kwargs)
+        finally:
+            d, tls.d = tls.d, None
+            d["exec"] = (time.perf_counter() - t0) * 1e3
+            tls.last = (d, len(scheduler_output.num_scheduled_tokens),
+                        int(getattr(scheduler_output, "total_num_scheduled_tokens", 0)))
+
+    def sample_tokens(self, *args, **kwargs):
+        if not is_rank0():
+            return samp_orig(self, *args, **kwargs)
+        t0 = time.perf_counter()
+        try:
+            return samp_orig(self, *args, **kwargs)
+        finally:
+            last = getattr(tls, "last", None)
+            if last is not None:
+                d, nreq, ntok = last
+                tls.last = None
+                if state["f"] is None:
+                    state["f"] = open(path + ".runner", "a", buffering=1 << 16)
+                state["f"].write("%.6f %d %d %s samp=%.3f\n" % (
+                    time.time(), nreq, ntok,
+                    " ".join("%s=%.3f" % (k, d.get(k, 0.0)) for k in ("prep", "wait", "join", "fwd", "exec")),
+                    (time.perf_counter() - t0) * 1e3))
+
+    NeuronModelRunner.execute_model = execute_model
+    NeuronModelRunner.sample_tokens = sample_tokens
+
+
+if os.environ.get("VLLM_NEURON_STEP_LOG"):
+    _install_runner_step_log(os.environ["VLLM_NEURON_STEP_LOG"])
