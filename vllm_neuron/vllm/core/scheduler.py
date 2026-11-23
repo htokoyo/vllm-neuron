@@ -1572,3 +1572,46 @@ class NeuronAsyncScheduler(NeuronScheduler, AsyncScheduler):
                 request.spec_token_ids = []
             else:
                 request.spec_token_ids = self._spec_token_placeholders
+
+
+# ── Per-step timing log (VLLM_NEURON_STEP_LOG=<path>; default off) ─────────────────────────────────────────────────
+# One line per engine step from the scheduler process: wall time, ms since the previous step's output was processed
+# (in a saturated engine this interval is the step cost), and the step kind (prefill requests, decode requests,
+# scheduled tokens). The runner side (neuron_model_runner, end of module) logs the host components of the same steps.
+# Installed only when the variable is set, so the scheduler is unchanged otherwise.
+def _install_step_log(path: str) -> None:
+    import time
+
+    sched_orig = NeuronScheduler.schedule
+    update_orig = NeuronScheduler.update_from_output
+
+    def schedule(self, *args, **kwargs):
+        out = sched_orig(self, *args, **kwargs)
+        n_pre = n_dec = 0
+        for req_id in out.num_scheduled_tokens:
+            req = self.requests.get(req_id)
+            if req is not None and req.num_computed_tokens - out.num_scheduled_tokens[req_id] < req.num_prompt_tokens:
+                n_pre += 1
+            else:
+                n_dec += 1
+        out._step_kind = (n_pre, n_dec, sum(out.num_scheduled_tokens.values()), len(self.running), len(self.waiting))
+        return out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        result = update_orig(self, scheduler_output, model_runner_output)
+        now = time.time()
+        kind = getattr(scheduler_output, "_step_kind", None)
+        if kind is not None:
+            if getattr(self, "_step_log_f", None) is None:
+                self._step_log_f = open(path, "a", buffering=1 << 16)
+                self._step_log_t = now
+            self._step_log_f.write("%.6f %.3f %d %d %d %d %d\n" % (now, (now - self._step_log_t) * 1e3, *kind))
+        self._step_log_t = now
+        return result
+
+    NeuronScheduler.schedule = schedule
+    NeuronScheduler.update_from_output = update_from_output
+
+
+if __import__("os").environ.get("VLLM_NEURON_STEP_LOG"):
+    _install_step_log(__import__("os").environ["VLLM_NEURON_STEP_LOG"])
