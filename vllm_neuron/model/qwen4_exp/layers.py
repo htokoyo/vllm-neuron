@@ -2796,3 +2796,49 @@ Qwen4ExpGatedResidual.forward = _hcs_forward
 # the NKI simulator; at up to 16 rows it is verified on device (TP=16 at 16 concurrent requests, TP=8). Defined at the end of the
 # file so that no line above moves.
 _GDN_ACT_MAX_B = 16
+
+
+# One-token dense decode window (VLLM_NEURON_QWEN4_ATTN_WINDOW=lean, default "ref"): _paged_decode_kvw builds the K
+# and V windows with two nested torch.where each over the whole decode bucket (S = 2,048 at MML 2048): columns < p from
+# the gathered cache, column p this step's k / v, columns > p zero (never-written HBM may hold NaN). In a TP=8 decode
+# profile those selects grew 1.0 -> 4.9 ms per 8-layer step for 32 -> 64 rows (VectorE). Here one select per tensor:
+# columns < p from the cache, every other column this step's k / v (finite). Columns > p are masked out of the softmax
+# by the same boolean mask (weight exactly 0 times a finite value), so the attention output is the reference's.
+_ATTN_WINDOW = __import__("os").environ.get("VLLM_NEURON_QWEN4_ATTN_WINDOW", "ref")
+
+
+def _paged_decode_kvw_lean(attn: Qwen4ExpAttention, x, positions, meta, num_valid=None, idx_meta=None):
+    if _ATTN_WINDOW != "lean":
+        return _paged_decode_kvw_ref(attn, x, positions, meta, num_valid, idx_meta)
+    b = x.shape[0]
+    q, k, v, gate = attn._qkv(x, positions)
+    kvh, d = attn.num_kv_heads, attn.head_dim
+    slots = meta["slot_mapping"].long()
+    k_tok = k.reshape(b, kvh, d).to(attn.k_cache.dtype)
+    v_tok = v.reshape(b, kvh, d).to(attn.v_cache.dtype)
+    rows_kv = kv_rows(slots, attn.k_cache)
+    kv_write(attn.k_cache, rows_kv, k_tok)
+    kv_write(attn.v_cache, rows_kv, v_tok)
+    table = meta["block_table_tensor"][:b].long().clamp(min=0)
+    kc, vc = _kv_window(attn.k_cache, table), _kv_window(attn.v_cache, table)
+    s_ctx = kc.shape[2]
+    col = torch.arange(s_ctx, device=x.device).view(1, 1, s_ctx, 1)
+    p = positions.view(b, 1, 1, 1)
+    past = col < p
+    kc = torch.where(past, kc, k_tok.view(b, kvh, 1, d))
+    vc = torch.where(past, vc, v_tok.view(b, kvh, 1, d))
+    mask = (col <= p).view(b, 1, 1, s_ctx)
+    if not attn.dense:
+        cur = positions.view(b, 1).long()
+        sel = _qsa_token_mask(attn, x, positions, idx_meta, cur, None)
+        mask = mask & sel[:, :, :s_ctx][:, None]
+    out = F.scaled_dot_product_attention(
+        q.transpose(1, 2), kc.to(q.dtype), vc.to(q.dtype), attn_mask=mask,
+        scale=attn.head_dim**-0.5, enable_gqa=True,
+    )
+    out = out.transpose(1, 2).reshape(b, 1, -1) * torch.sigmoid(gate)
+    return all_reduce(attn.o_proj(out), attn.tp)
+
+
+_paged_decode_kvw_ref = _paged_decode_kvw
+_paged_decode_qsa_ref = _paged_decode_kvw_lean
