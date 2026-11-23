@@ -2796,3 +2796,87 @@ Qwen4ExpGatedResidual.forward = _hcs_forward
 # the NKI simulator; at up to 16 rows it is verified on device (TP=16 at 16 concurrent requests, TP=8). Defined at the end of the
 # file so that no line above moves.
 _GDN_ACT_MAX_B = 16
+
+
+# GDN decode above _GDN_ACT_MAX_B rows: the recurrence kernel runs on row chunks of _GDN_ACT_CHUNK rows with gdn_tkg_act
+# (env VLLM_NEURON_QWEN4_GDN_ACT_CHUNK, default 16; 0 = the previous single gdn_tkg call). gdn_tkg keeps the fp32 state
+# of every (row, head) of its core plus a bf16 copy in SBUF; at 64 rows (TP=8: 6 heads per row, 192 per core) that
+# spills: 101.6 vs 12.8 MB of HBM traffic per call at 32 rows, 1.34 ms vs 0.55 ms on device. gdn_tkg_act on 16 rows is
+# the configuration verified on device (TP=8 / TP=16 at 16 concurrent requests) and runs 139 us per call (TP=8 rank
+# shapes): 4 calls for 64 rows = 0.56 ms. Rows are independent, so the chunks give each row the 16-row kernel's result;
+# the in/out projections, the gate inputs and the out_proj all-reduce stay one op over all rows.
+_GDN_ACT_CHUNK = int(__import__("os").environ.get("VLLM_NEURON_QWEN4_GDN_ACT_CHUNK", "16"))
+
+
+def _gdn_decode_kernel_chunked(self, x, mixed, recurrent_state):
+    b = x.shape[0]
+    c = _GDN_ACT_CHUNK
+    if not (0 < c <= _GDN_ACT_MAX_B and b > _GDN_ACT_MAX_B):
+        return _gdn_decode_kernel_single(self, x, mixed, recurrent_state)
+    from vllm_neuron._kernels.qwen4_exp.gdn_tkg_act import gdn_tkg_act
+
+    hv, hk = self.num_v_heads, self.num_k_heads
+    rep = hv // hk
+    q, k, v = mixed[..., 0].split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+    q = q.view(b, hk, self.head_k_dim).repeat_interleave(rep, dim=1).to(x.dtype)
+    k = k.view(b, hk, self.head_k_dim).repeat_interleave(rep, dim=1).to(x.dtype)
+    v = v.reshape(b, hv, self.head_v_dim).to(x.dtype)
+    bb = self.in_proj_b(x).float().reshape(b, hv)
+    aa = self.in_proj_a(x).float().reshape(b, hv)
+    z = self.in_proj_z(x).reshape(b, hv, self.head_v_dim).to(x.dtype)
+    st = recurrent_state.reshape(b, hv, self.head_k_dim, self.head_v_dim).float()
+    outs, states = [], []
+    for r0 in range(0, b, c):
+        r1 = min(b, r0 + c)
+        n = (r1 - r0) * hv
+        o, s = _nki(gdn_tkg_act)(
+            q=q[r0:r1].reshape(n, -1), k=k[r0:r1].reshape(n, -1), v=v[r0:r1].reshape(n, -1),
+            b=bb[r0:r1].reshape(n), a=aa[r0:r1].reshape(n), A_log=self.A_log.float(), dt_bias=self.dt_bias.float(),
+            z=z[r0:r1].reshape(n, -1), norm_weight=self.norm.weight.float(),
+            state_in=st[r0:r1].reshape(n, self.head_k_dim, self.head_v_dim),
+            gate_activation=self.norm.activation, rsqrt_group=8,
+        )
+        outs.append(o)
+        states.append(s)
+    out = torch.cat(outs).to(x.dtype).reshape(b, 1, self.value_dim)
+    state = torch.cat(states).reshape(recurrent_state.shape)
+    return all_reduce(self.out_proj(out), self.tp), state
+
+
+_gdn_decode_kernel_single = Qwen4ExpGatedDeltaNet._decode_kernel
+Qwen4ExpGatedDeltaNet._decode_kernel = _gdn_decode_kernel_chunked
+
+
+# VLLM_NEURON_QWEN4_GDN_DECODE=grp: steps above _GDN_ACT_MAX_B rows run the recurrence in ONE gdn_tkg_grp call
+# (_kernels/qwen4_exp/gdn_tkg_grp.py: per-head scalars as columns of [128, heads] tiles, one [k | q] matmul per head, the
+# rank-1 state updates four heads per matmul, state streamed in groups of 16 heads). TP=8 rank shapes on device:
+# 166 / 324 / 642 us at 16 / 32 / 64 rows (gdn_tkg 274 / 546 / 1,339; gdn_tkg_act 139 / 283 / does not compile).
+# Not bit-identical to gdn_tkg (k^T S and q^T S from one bf16 S read, then scaled by exp(g)); NKI simulator vs an
+# fp64 reference: cosine 0.999996 (out) / 0.999999 (state), as gdn_tkg's own 0.999994 / 0.999999.
+_GDN_DECODE_IMPL = __import__("os").environ.get("VLLM_NEURON_QWEN4_GDN_DECODE", "act")
+
+
+def _gdn_decode_kernel_grp(self, x, mixed, recurrent_state):
+    b = x.shape[0]
+    if not (_GDN_DECODE_IMPL == "grp" and b > _GDN_ACT_MAX_B):
+        return _gdn_decode_kernel_chunked(self, x, mixed, recurrent_state)
+    from vllm_neuron._kernels.qwen4_exp.gdn_tkg_grp import gdn_tkg_grp
+
+    rep = self.num_v_heads // self.num_k_heads
+    q, k, v = mixed[..., 0].split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+    q = q.view(b, self.num_k_heads, self.head_k_dim).repeat_interleave(rep, dim=1)
+    k = k.view(b, self.num_k_heads, self.head_k_dim).repeat_interleave(rep, dim=1)
+    bh = b * self.num_v_heads
+    out, state = _nki(gdn_tkg_grp)(
+        q=q.reshape(bh, -1).to(x.dtype), k=k.reshape(bh, -1).to(x.dtype), v=v.reshape(bh, -1).to(x.dtype),
+        b=self.in_proj_b(x).float().reshape(bh), a=self.in_proj_a(x).float().reshape(bh),
+        A_log=self.A_log.float(), dt_bias=self.dt_bias.float(), z=self.in_proj_z(x).reshape(bh, -1).to(x.dtype),
+        norm_weight=self.norm.weight.float(),
+        state_in=recurrent_state.reshape(bh, self.head_k_dim, self.head_v_dim).float(),
+        gate_activation=self.norm.activation, group=16,
+    )
+    out = out.to(x.dtype).reshape(b, 1, self.value_dim)
+    return all_reduce(self.out_proj(out), self.tp), state.reshape(recurrent_state.shape)
+
+
+Qwen4ExpGatedDeltaNet._decode_kernel = _gdn_decode_kernel_grp
