@@ -1064,3 +1064,128 @@ def _qwen4_exp_tp_init(self, config):
 
 _qwen4_exp_tp_orig_init = Qwen4ExpForCausalLM.__init__
 Qwen4ExpForCausalLM.__init__ = _qwen4_exp_tp_init
+
+
+# ── State-pool row I/O on the Sync queue (VLLM_NEURON_QWEN4_STATE_DMA, default 1) ───────────────────────────────────
+# _pool_write's per-row ``pool[w[j]] = v[j]`` lowers to a software-DGE scatter issued by GpSimd (~13 DMAs and their
+# address arithmetic per row and pool, serialized on GpSimd). A TP=8 decode device profile (8-layer model) put the pool
+# writes at 6.4 / 13.8 ms of a 26.7 / 60.6 ms step at B=32 / 64, the largest component of the step. Where NKI kernels
+# run, every state-pool row write of the graphs (GDN conv / recurrent and PLE conv pools, decode, prefill and the MTP
+# snapshot rows) and the n-gram context pool commit take _kernels/qwen4_exp/state_rows_io.state_rows_write_tkg: one hardware-DGE DMA per (row, LNC
+# program) issued by the Sync engine, in place (the kernel returns the pool, an aliased output). Byte copies: the pools
+# are bit-identical (NKI simulator). The dummy-slot -> sink mapping of _pool_write is unchanged.
+_STATE_DMA = __import__("os").environ.get("VLLM_NEURON_QWEN4_STATE_DMA", "1") == "1"
+# parts (env VLLM_NEURON_QWEN4_STATE_DMA_PARTS, default "write,ngram"): "write" = the state-pool row writes of the
+# graphs; "ngram" = the n-gram context pool commit (after the lm head, so outside the write fence below; deterministic
+# on device alone and with "write": 8/8 greedy prompts identical across runs and to the scatter build). Opt-in only:
+# "read" = the 3-D pool reads (neutral at B=64 and 3x slower at B=32 on device, 8-layer A/B).
+_SDMA_PARTS = __import__("os").environ.get("VLLM_NEURON_QWEN4_STATE_DMA_PARTS", "write,ngram").split(",")
+_pool_write_scatter = _pool_write
+_pool_rows_before_dma = _pool_rows
+_device_ngram_commit_scatter = _device_ngram_commit
+
+
+def _pool_write(pool, slots, b, value):  # noqa: F811
+    if not (_STATE_DMA and "write" in _SDMA_PARTS and _ple_layers._kernels_available(pool)):
+        return _pool_write_scatter(pool, slots, b, value)
+    from vllm_neuron._kernels.qwen4_exp.state_rows_io import state_rows_write_tkg
+
+    sink = pool.shape[0] - 1
+    w = slots[:b] + (slots[:b] == sink - 1).to(slots.dtype)  # dummy slot -> sink (as _pool_write_scatter)
+    _ple_layers._nki(state_rows_write_tkg)(pool=pool, slots=w.to(torch.int32).reshape(b, 1),
+                                           value=value[:b].to(pool.dtype).contiguous())
+
+
+def _pool_rows(pool, slots, b):  # noqa: F811
+    if pool.dim() == 4 or not (_STATE_DMA and "read" in _SDMA_PARTS and _ple_layers._kernels_available(pool)):
+        return _pool_rows_before_dma(pool, slots, b)
+    from vllm_neuron._kernels.qwen4_exp.state_rows_io import state_rows_read_tkg
+
+    return _ple_layers._nki(state_rows_read_tkg)(pool=pool, slots=slots[:b].to(torch.int32).reshape(b, 1))
+
+
+def _device_ngram_commit(self, upd, tokens):  # noqa: F811
+    """As above; the per-row pool writes by state_rows_write_tkg (the n-gram pool has no sink row: plain slots)."""
+    if not (_STATE_DMA and "ngram" in _SDMA_PARTS and _ple_layers._kernels_available(self._ngram_ctx_pool)):
+        return _device_ngram_commit_scatter(self, upd, tokens)
+    from vllm_neuron._kernels.qwen4_exp.state_rows_io import state_rows_write_tkg
+
+    b, seq = upd["b"], upd["seq"]
+    if upd["verify"]:
+        count = (tokens[:b] != -1).sum(dim=1).to(torch.int32)
+    else:
+        count = upd["num_valid"]
+    w = self._ngram_ctx_pool.shape[1]
+    idx = count.clamp(min=0).view(-1, 1) + torch.arange(w, device=seq.device, dtype=torch.int32).view(1, w)
+    new = torch.gather(seq, 1, idx.long())
+    _ple_layers._nki(state_rows_write_tkg)(pool=self._ngram_ctx_pool, slots=upd["slots"][:b].to(torch.int32).reshape(b, 1),
+                                           value=new[:b].to(self._ngram_ctx_pool.dtype).contiguous())
+
+
+
+# Ordering of the in-place pool writes. state_rows_write_tkg writes a pool through an aliased kernel output; on device,
+# without a consumer of that output inside the graph, the writes were not ordered before later reads of the pools (greedy
+# outputs of the same prompts changed between runs: 3/8 identical on an 8-layer TP=8 replica). The fence: one element
+# of every pool written so far in the step, times 0, is added to the lm-head input (bf16), so every write completes
+# before the logits (deterministic and identical to the scatter build, 8/8, on device). Writes issued after the lm head
+# (MTP verify commits the verified state after the rejection sampler) are fenced into the step's float output (the
+# logits / hidden streams of the tuple). A fence added to the sampled int32 tokens instead did not order the writes on
+# device. VLLM_NEURON_QWEN4_STATE_DMA_FENCE=0 turns it off (A/B only).
+_SDMA_FENCE = __import__("os").environ.get("VLLM_NEURON_QWEN4_STATE_DMA_FENCE", "1") == "1"
+_fence_terms: list = []
+_pool_write_nofence = _pool_write
+
+
+def _pool_write(pool, slots, b, value):  # noqa: F811
+    _pool_write_nofence(pool, slots, b, value)
+    if _SDMA_FENCE and _STATE_DMA and "write" in _SDMA_PARTS and _ple_layers._kernels_available(pool):
+        _fence_terms.append(pool.view(-1)[:1])
+
+
+def _fence_value(dtype):
+    f = torch.cat([t.reshape(1).float() for t in _fence_terms]).sum()
+    _fence_terms.clear()
+    return (f * 0.0).to(dtype)
+
+
+def _fence_pre_hook(mod, args):
+    if not _fence_terms:
+        return None
+    x = args[0]
+    return (x + _fence_value(x.dtype),) + tuple(args[1:])
+
+
+def _fence_apply(out):
+    """Writes still pending after the lm head: fenced into the first floating-point tensor of the output tuple."""
+    if not _fence_terms or not isinstance(out, tuple):
+        _fence_terms.clear()
+        return out
+    out = list(out)
+    for j, t in enumerate(out):
+        if torch.is_tensor(t) and t.dtype.is_floating_point:
+            out[j] = t + _fence_value(t.dtype)
+            break
+    _fence_terms.clear()
+    return tuple(out)
+
+
+_host_forward_nofence = _host_forward
+
+
+def _host_forward_fenced(self, *args, **kwargs):
+    _fence_terms.clear()
+    return _fence_apply(_host_forward_nofence(self, *args, **kwargs))
+
+
+def _fence_init(self, config):
+    _fence_orig_init(self, config)
+    if _SDMA_FENCE:
+        self.lm_head.register_forward_pre_hook(_fence_pre_hook)
+
+
+_fence_orig_init = Qwen4ExpForCausalLM.__init__
+Qwen4ExpForCausalLM.__init__ = _fence_init
+
+
+# _forward_device_ngram (TP >= 32) and ple_host._forward_host_ngram (TP < 32) both call the module global _host_forward.
+_host_forward = _host_forward_fenced
